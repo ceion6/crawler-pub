@@ -1,0 +1,7 @@
+beautifulsoup4==4.12.3
+cloudscraper==1.2.71
+lxml==5.2.2
+python-dotenv==1.0.1
+requests==2.32.3
+selenium==4.27.1
+webdriver-manager==4.0.2
