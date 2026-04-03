@@ -32,3 +32,4 @@ Public execution runner for scheduled crawl jobs.
 - This repository is execution-only.
 - Runtime state and target catalogs are provided by the private service.
 - 内置对 `4noggins.com` / `www.4noggins.com` 的保守策略，避免瞬时并发过高导致临时 `503`。
+- 内部监控 API 签名采用请求级 `X-Nonce`，签名覆盖 `timestamp + method + path + query + nonce + body`。
