@@ -62,21 +62,54 @@ class StrategyRuntime:
             return
         info('策略包已加载成功')
 
-    def evaluate(self, task: Dict, html: str) -> Dict:
+    def _get_strategy(self, task: Dict):
         if self._registry is None:
+            return None
+        url = task.get('url', '')
+        return self._registry.get_strategy(url)
+
+    @staticmethod
+    def _normalize_strategy_task(task: Dict) -> Dict:
+        normalized = dict(task or {})
+        normalized.setdefault('name', normalized.get('product_name', '') or '')
+        normalized.setdefault('site', normalized.get('site_name', '') or '')
+        return normalized
+
+    def requires_selenium(self, task: Dict) -> bool:
+        strategy = self._get_strategy(task)
+        if strategy is None:
+            return False
+        try:
+            return bool(strategy.requires_selenium())
+        except Exception:
+            return False
+
+    def get_request_headers(self, task: Dict) -> Dict[str, str]:
+        strategy = self._get_strategy(task)
+        if strategy is None:
+            return {}
+        try:
+            headers = strategy.get_request_headers() or {}
+        except Exception:
+            return {}
+        return headers if isinstance(headers, dict) else {}
+
+    def evaluate(self, task: Dict, html: str) -> Dict:
+        strategy = self._get_strategy(task)
+        if strategy is None:
             return {}
 
-        url = task.get('url', '')
-        strategy = self._registry.get_strategy(url)
+        normalized_task = self._normalize_strategy_task(task)
+        url = normalized_task.get('url', '')
 
         if strategy.requires_selenium():
-            return self._evaluate_selenium(strategy, url, task)
+            return self._evaluate_selenium(strategy, url, normalized_task)
 
         soup = BeautifulSoup(html, 'lxml')
         text_content = soup.get_text(' ', strip=True).lower()
         in_stock = bool(strategy.check_stock(soup, url, text_content))
         try:
-            price = strategy.extract_price(soup, url, task) or ''
+            price = strategy.extract_price(soup, url, normalized_task) or ''
         except TypeError:
             price = strategy.extract_price(soup, url) or ''
         return {

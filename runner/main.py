@@ -12,6 +12,7 @@ from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
 import cloudscraper
+from curl_cffi import requests as curl_requests
 from requests import RequestException
 from bs4 import BeautifulSoup
 
@@ -28,6 +29,12 @@ TRANSIENT_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 STRATEGY_RUNTIME = StrategyRuntime()
 VALID_TIERS = ('low', 'high')
 VALID_SOURCE_MODES = ('all', 'subscription', 'baseline')
+TLS_IMPERSONATION_HOSTS = {
+    'smokingpipes.com',
+    'www.smokingpipes.com',
+    'cgarsltd.co.uk',
+    'www.cgarsltd.co.uk',
+}
 
 
 @dataclass(frozen=True)
@@ -175,12 +182,27 @@ def _compute_retry_delay(attempt_index: int, policy: HostPolicy, response=None) 
     return min(policy.backoff_cap_seconds, backoff + jitter)
 
 
-def _request_once(scraper, url: str, gate: Optional[HostGate]):
+def _build_http_client(host: str):
+    if host in TLS_IMPERSONATION_HOSTS:
+        return curl_requests.Session()
+    return cloudscraper.create_scraper()
+
+
+def _request_with_headers(scraper, url: str, headers: Dict[str, str], use_impersonation: bool):
+    if use_impersonation:
+        impersonate = os.getenv('MONITOR_HTTP_IMPERSONATE', 'chrome120').strip() or 'chrome120'
+        return scraper.get(url, timeout=20, headers=headers, impersonate=impersonate)
+    return scraper.get(url, timeout=20, headers=headers)
+
+
+def _request_once(scraper, url: str, gate: Optional[HostGate], headers: Optional[Dict[str, str]] = None):
+    request_headers = headers or {}
+    use_impersonation = _normalize_host(url) in TLS_IMPERSONATION_HOSTS
     if gate is None:
-        return scraper.get(url, timeout=20)
+        return _request_with_headers(scraper, url, request_headers, use_impersonation)
     gate.acquire()
     try:
-        return scraper.get(url, timeout=20)
+        return _request_with_headers(scraper, url, request_headers, use_impersonation)
     finally:
         gate.release()
 
@@ -197,10 +219,14 @@ def crawl_one(
     host = _normalize_host(url)
     host_policy = _resolve_host_policy(host, host_policy_overrides)
     host_gate = host_gates.get(host) if host_gates else None
-    scraper = cloudscraper.create_scraper()
+    if STRATEGY_RUNTIME.requires_selenium(task):
+        return {'url': url, **STRATEGY_RUNTIME.evaluate(task, '')}
+
+    scraper = _build_http_client(host)
+    request_headers = STRATEGY_RUNTIME.get_request_headers(task)
     for attempt in range(1, host_policy.max_attempts + 1):
         try:
-            response = _request_once(scraper, url, host_gate)
+            response = _request_once(scraper, url, host_gate, headers=request_headers)
             if response.status_code != 200:
                 if attempt < host_policy.max_attempts and _should_retry_status(response.status_code):
                     delay = _compute_retry_delay(attempt, host_policy, response=response)

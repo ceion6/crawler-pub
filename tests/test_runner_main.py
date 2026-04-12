@@ -70,6 +70,31 @@ class RunnerMainTests(unittest.TestCase):
     def test_parse_tiers_keeps_unique_supported_values(self):
         self.assertEqual(main._parse_tiers('high,low,high,invalid'), ['high', 'low'])
 
+    def test_build_http_client_uses_tls_impersonation_session_for_smokingpipes(self):
+        with patch('runner.main.curl_requests.Session', return_value='curl-session') as curl_session_mock:
+            client = main._build_http_client('www.smokingpipes.com')
+
+        self.assertEqual(client, 'curl-session')
+        curl_session_mock.assert_called_once()
+
+    def test_crawl_one_short_circuits_http_for_selenium_strategy(self):
+        task = {'url': 'https://www.pipeuncle.com/detail/goods?id=261'}
+
+        with patch.object(main.STRATEGY_RUNTIME, 'requires_selenium', return_value=True):
+            with patch.object(
+                main.STRATEGY_RUNTIME,
+                'evaluate',
+                return_value={'fetch_ok': True, 'in_stock': True, 'price': '$9.99', 'reason': ''},
+            ) as evaluate_mock:
+                with patch('runner.main.cloudscraper.create_scraper') as create_scraper_mock:
+                    result = main.crawl_one(task)
+
+        self.assertTrue(result['fetch_ok'])
+        self.assertTrue(result['in_stock'])
+        self.assertEqual(result['price'], '$9.99')
+        evaluate_mock.assert_called_once_with(task, '')
+        create_scraper_mock.assert_not_called()
+
     def test_main_paginates_and_runs_multiple_tiers(self):
         task_a = {'url': 'https://example.test/a'}
         task_b = {'url': 'https://example.test/b'}
