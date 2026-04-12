@@ -1,20 +1,23 @@
+import base64
 import os
 import re
 import time
 import json
 import random
 import threading
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from email.utils import parsedate_to_datetime
-from typing import Dict, List, Optional
-from urllib.parse import urlparse
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, urlparse
 
 import cloudscraper
 from curl_cffi import requests as curl_requests
 from requests import RequestException
 from bs4 import BeautifulSoup
+from Crypto.Cipher import AES
 
 from runner.report_client import report_results
 from runner.safe_logger import error, info, warn
@@ -29,11 +32,24 @@ TRANSIENT_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 STRATEGY_RUNTIME = StrategyRuntime()
 VALID_TIERS = ('low', 'high')
 VALID_SOURCE_MODES = ('all', 'subscription', 'baseline')
+SKIPPED_HOSTS = {
+    'smokingpipes.com',
+    'www.smokingpipes.com',
+}
+PIPEUNCLE_HOSTS = {
+    'pipeuncle.com',
+    'www.pipeuncle.com',
+}
+PIPEUNCLE_AES_KEY = b'0f5ef28c56b64e67'
 TLS_IMPERSONATION_HOSTS = {
     'smokingpipes.com',
     'www.smokingpipes.com',
     'cgarsltd.co.uk',
     'www.cgarsltd.co.uk',
+    'havahavana.com',
+    'www.havahavana.com',
+    'tobaccolifestyle.com',
+    'www.tobaccolifestyle.com',
 }
 
 
@@ -59,6 +75,14 @@ DEFAULT_HOST_POLICY = HostPolicy()
 DEFAULT_HOST_POLICY_OVERRIDES = {
     '4noggins.com': HostPolicy(max_parallel=1, min_interval_seconds=2.0, max_attempts=4, backoff_base_seconds=2.0),
     'www.4noggins.com': HostPolicy(max_parallel=1, min_interval_seconds=2.0, max_attempts=4, backoff_base_seconds=2.0),
+    'dreamingpipes.com': HostPolicy(max_parallel=1, min_interval_seconds=1.5, max_attempts=4, backoff_base_seconds=2.0),
+    'www.dreamingpipes.com': HostPolicy(max_parallel=1, min_interval_seconds=1.5, max_attempts=4, backoff_base_seconds=2.0),
+    'havahavana.com': HostPolicy(max_parallel=1, min_interval_seconds=2.5, max_attempts=4, backoff_base_seconds=2.0),
+    'www.havahavana.com': HostPolicy(max_parallel=1, min_interval_seconds=2.5, max_attempts=4, backoff_base_seconds=2.0),
+    'pipeuncle.com': HostPolicy(max_parallel=1, min_interval_seconds=1.0, max_attempts=3, backoff_base_seconds=1.5),
+    'www.pipeuncle.com': HostPolicy(max_parallel=1, min_interval_seconds=1.0, max_attempts=3, backoff_base_seconds=1.5),
+    'tobaccolifestyle.com': HostPolicy(max_parallel=1, min_interval_seconds=2.5, max_attempts=4, backoff_base_seconds=2.0),
+    'www.tobaccolifestyle.com': HostPolicy(max_parallel=1, min_interval_seconds=2.5, max_attempts=4, backoff_base_seconds=2.0),
 }
 
 
@@ -99,8 +123,153 @@ def _extract_price(text: str) -> str:
     return match.group(1) if match else ''
 
 
+def _format_price(value) -> str:
+    if value in (None, ''):
+        return ''
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ''
+        if text[0] in '$€£¥':
+            return text
+        value = text
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return str(value).strip()
+    return f'${numeric:.2f}'
+
+
 def _normalize_host(url: str) -> str:
     return urlparse(url).netloc.lower().strip()
+
+
+def _format_counter(counter: Counter, limit: int = 12) -> str:
+    if not counter:
+        return ''
+    items = sorted(counter.items(), key=lambda item: (-item[1], item[0]))
+    return ', '.join(f'{key}={value}' for key, value in items[:limit])
+
+
+def _is_skip_result(result: Dict) -> bool:
+    return bool(result.get('skip_update'))
+
+
+def _build_skip_result(url: str, reason: str) -> Dict:
+    return {
+        'url': url,
+        'fetch_ok': False,
+        'in_stock': False,
+        'price': '',
+        'reason': reason,
+        'skip_update': True,
+    }
+
+
+def _extract_pipeuncle_goods_id(url: str) -> str:
+    goods_ids = parse_qs(urlparse(url).query).get('id', [])
+    if not goods_ids:
+        return ''
+    goods_id = str(goods_ids[0]).strip()
+    return goods_id if goods_id.isdigit() else ''
+
+
+def _decrypt_pipeuncle_payload(encrypted_text: str) -> Dict:
+    raw = base64.b64decode((encrypted_text or '').strip())
+    if not raw:
+        raise ValueError('empty_pipeuncle_payload')
+
+    plain = AES.new(PIPEUNCLE_AES_KEY, AES.MODE_ECB).decrypt(raw)
+    pad_size = plain[-1]
+    if pad_size < 1 or pad_size > AES.block_size:
+        raise ValueError('invalid_pipeuncle_padding')
+    if plain[-pad_size:] != bytes([pad_size]) * pad_size:
+        raise ValueError('corrupted_pipeuncle_padding')
+
+    return json.loads(plain[:-pad_size].decode('utf-8'))
+
+
+def _crawl_pipeuncle_via_api(url: str, gate: Optional[HostGate] = None) -> Dict:
+    goods_id = _extract_pipeuncle_goods_id(url)
+    if not goods_id:
+        return {'url': url, 'fetch_ok': False, 'in_stock': False, 'price': '', 'reason': 'pipeuncle_goods_id_missing'}
+
+    api_url = f'https://www.pipeuncle.com/api/goods/detail?id={goods_id}&activity=default'
+    headers = {
+        'Accept': 'application/json, text/plain, */*',
+        'Origin': 'https://www.pipeuncle.com',
+        'Referer': url,
+    }
+    impersonate = os.getenv('MONITOR_HTTP_IMPERSONATE', 'chrome120').strip() or 'chrome120'
+
+    if gate is not None:
+        gate.acquire()
+    try:
+        response = curl_requests.get(api_url, timeout=20, headers=headers, impersonate=impersonate)
+    except Exception as exc:
+        return {
+            'url': url,
+            'fetch_ok': False,
+            'in_stock': False,
+            'price': '',
+            'reason': f'pipeuncle_api_exception:{type(exc).__name__}',
+        }
+    finally:
+        if gate is not None:
+            gate.release()
+
+    if response.status_code != 200:
+        return {
+            'url': url,
+            'fetch_ok': False,
+            'in_stock': False,
+            'price': '',
+            'reason': f'pipeuncle_http_{response.status_code}',
+        }
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        return {
+            'url': url,
+            'fetch_ok': False,
+            'in_stock': False,
+            'price': '',
+            'reason': f'pipeuncle_json_error:{type(exc).__name__}',
+        }
+
+    if payload.get('code') != 200:
+        return {
+            'url': url,
+            'fetch_ok': False,
+            'in_stock': False,
+            'price': '',
+            'reason': f'pipeuncle_api_code_{payload.get("code", "unknown")}',
+        }
+
+    try:
+        detail = _decrypt_pipeuncle_payload(payload.get('data', ''))
+    except Exception as exc:
+        return {
+            'url': url,
+            'fetch_ok': False,
+            'in_stock': False,
+            'price': '',
+            'reason': f'pipeuncle_decrypt_failed:{type(exc).__name__}',
+        }
+
+    try:
+        total_stock = int(detail.get('totalStock') or 0)
+    except (TypeError, ValueError):
+        total_stock = 0
+
+    return {
+        'url': url,
+        'fetch_ok': True,
+        'in_stock': total_stock > 0,
+        'price': _format_price(detail.get('sellPrice')),
+        'reason': '',
+    }
 
 
 def _load_host_policy_overrides() -> Dict[str, HostPolicy]:
@@ -217,8 +386,13 @@ def crawl_one(
         return {'url': '', 'fetch_ok': False, 'in_stock': False, 'price': '', 'reason': 'empty_url'}
 
     host = _normalize_host(url)
-    host_policy = _resolve_host_policy(host, host_policy_overrides)
     host_gate = host_gates.get(host) if host_gates else None
+    if host in SKIPPED_HOSTS:
+        return _build_skip_result(url, 'skipped_smokingpipes')
+    if host in PIPEUNCLE_HOSTS:
+        return _crawl_pipeuncle_via_api(url, gate=host_gate)
+
+    host_policy = _resolve_host_policy(host, host_policy_overrides)
     if STRATEGY_RUNTIME.requires_selenium(task):
         return {'url': url, **STRATEGY_RUNTIME.evaluate(task, '')}
 
@@ -315,37 +489,78 @@ def _load_run_config() -> RunConfig:
 
 
 def _summarize_results(results: List[Dict]) -> Dict[str, int]:
-    ok_count = sum(1 for row in results if row.get('fetch_ok'))
-    stock_count = sum(1 for row in results if row.get('in_stock'))
-    failed_count = len(results) - ok_count
+    reportable_results = [row for row in results if not _is_skip_result(row)]
+    skipped_count = len(results) - len(reportable_results)
+    ok_count = sum(1 for row in reportable_results if row.get('fetch_ok'))
+    stock_count = sum(1 for row in reportable_results if row.get('in_stock'))
+    failed_count = len(reportable_results) - ok_count
     return {
         'total': len(results),
+        'reported': len(reportable_results),
         'ok': ok_count,
         'failed': failed_count,
+        'skipped': skipped_count,
         'in_stock': stock_count,
     }
 
 
-def _process_task_page(run_id: str, tier: str, config: RunConfig, page_index: int, offset: int, tasks: List[Dict]) -> Dict[str, int]:
+def _summarize_issues(results: List[Dict]) -> Tuple[Counter, Counter]:
+    reason_counts: Counter = Counter()
+    host_counts: Counter = Counter()
+    for row in results:
+        if row.get('fetch_ok') and not _is_skip_result(row):
+            continue
+        reason = str(row.get('reason', '') or 'unknown').strip() or 'unknown'
+        host = _normalize_host(row.get('url', '')) or 'unknown'
+        reason_counts[reason] += 1
+        host_counts[host] += 1
+    return reason_counts, host_counts
+
+
+def _log_issue_summary(scope: str, run_id: str, tier: str, source_mode: str, page_index: Optional[int], reason_counts: Counter, host_counts: Counter) -> None:
+    if not reason_counts:
+        return
+    page_suffix = '' if page_index is None else f' page={page_index}'
+    warn(
+        f'{scope}问题聚合 run_id={run_id} tier={tier} source_mode={source_mode}'
+        f'{page_suffix} reasons={_format_counter(reason_counts)}'
+    )
+    warn(
+        f'{scope}站点聚合 run_id={run_id} tier={tier} source_mode={source_mode}'
+        f'{page_suffix} hosts={_format_counter(host_counts)}'
+    )
+
+
+def _process_task_page(run_id: str, tier: str, config: RunConfig, page_index: int, offset: int, tasks: List[Dict]) -> Dict[str, object]:
     info(
         f'开始执行任务，tier={tier} source_mode={config.source_mode} '
         f'page={page_index} offset={offset} 任务数={len(tasks)}'
     )
     results = crawl_all(tasks, max_workers=config.max_workers)
     summary = _summarize_results(results)
-    payload = report_results(run_id=run_id, results=results)
+    reason_counts, host_counts = _summarize_issues(results)
+    reportable_results = [row for row in results if not _is_skip_result(row)]
+    payload = {'updated': 0, 'push_enabled': False}
+    if reportable_results:
+        payload = report_results(run_id=run_id, results=reportable_results)
     info(
         f'页执行完成 run_id={run_id} tier={tier} source_mode={config.source_mode} '
-        f'page={page_index} total={summary["total"]} ok={summary["ok"]} failed={summary["failed"]} '
+        f'page={page_index} total={summary["total"]} reported={summary["reported"]} '
+        f'ok={summary["ok"]} failed={summary["failed"]} skipped={summary["skipped"]} '
         f'in_stock={summary["in_stock"]} updated={payload.get("updated", 0)} '
         f'push_enabled={payload.get("push_enabled", False)}'
     )
+    _log_issue_summary('页', run_id, tier, config.source_mode, page_index, reason_counts, host_counts)
     return {
         'total': summary['total'],
+        'reported': summary['reported'],
         'ok': summary['ok'],
         'failed': summary['failed'],
+        'skipped': summary['skipped'],
         'in_stock': summary['in_stock'],
         'updated': int(payload.get('updated', 0)),
+        'reason_counts': reason_counts,
+        'host_counts': host_counts,
     }
 
 
@@ -357,11 +572,15 @@ def main() -> None:
     STRATEGY_RUNTIME.load()
     totals = {
         'total': 0,
+        'reported': 0,
         'ok': 0,
         'failed': 0,
+        'skipped': 0,
         'in_stock': 0,
         'updated': 0,
     }
+    run_reason_counts: Counter = Counter()
+    run_host_counts: Counter = Counter()
     refresh_on_this_page = config.refresh_on_first_pull
     fetched_any_task = False
 
@@ -388,6 +607,8 @@ def main() -> None:
             page_totals = _process_task_page(run_id, tier, config, page_index, offset, tasks)
             for key in totals:
                 totals[key] += page_totals[key]
+            run_reason_counts.update(page_totals['reason_counts'])
+            run_host_counts.update(page_totals['host_counts'])
 
             batch_size = len(tasks)
             offset += batch_size
@@ -400,10 +621,12 @@ def main() -> None:
 
     elapsed = time.time() - start
     info(
-        f'运行结束 run_id={run_id} total={totals["total"]} ok={totals["ok"]} '
-        f'failed={totals["failed"]} in_stock={totals["in_stock"]} updated={totals["updated"]} '
+        f'运行结束 run_id={run_id} total={totals["total"]} reported={totals["reported"]} '
+        f'ok={totals["ok"]} failed={totals["failed"]} skipped={totals["skipped"]} '
+        f'in_stock={totals["in_stock"]} updated={totals["updated"]} '
         f'elapsed={elapsed:.1f}s'
     )
+    _log_issue_summary('运行', run_id, 'all', config.source_mode, None, run_reason_counts, run_host_counts)
 
 
 if __name__ == '__main__':

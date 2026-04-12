@@ -1,6 +1,10 @@
+import base64
+import json
 import unittest
 from contextlib import ExitStack
 from unittest.mock import Mock, patch
+
+from Crypto.Cipher import AES
 
 from runner import main
 
@@ -18,6 +22,12 @@ class RunnerMainTests(unittest.TestCase):
         self.assertEqual(policy.max_parallel, 1)
         self.assertEqual(policy.max_attempts, 4)
         self.assertGreaterEqual(policy.min_interval_seconds, 2.0)
+
+    def test_resolve_host_policy_uses_conservative_defaults_for_havahavana(self):
+        policy = main._resolve_host_policy('www.havahavana.com')
+        self.assertEqual(policy.max_parallel, 1)
+        self.assertEqual(policy.max_attempts, 4)
+        self.assertGreaterEqual(policy.min_interval_seconds, 2.5)
 
     def test_compute_retry_delay_prefers_retry_after_header(self):
         policy = main.HostPolicy(backoff_cap_seconds=20.0)
@@ -78,7 +88,7 @@ class RunnerMainTests(unittest.TestCase):
         curl_session_mock.assert_called_once()
 
     def test_crawl_one_short_circuits_http_for_selenium_strategy(self):
-        task = {'url': 'https://www.pipeuncle.com/detail/goods?id=261'}
+        task = {'url': 'https://selenium-only.example.test/product/1'}
 
         with patch.object(main.STRATEGY_RUNTIME, 'requires_selenium', return_value=True):
             with patch.object(
@@ -95,6 +105,77 @@ class RunnerMainTests(unittest.TestCase):
         evaluate_mock.assert_called_once_with(task, '')
         create_scraper_mock.assert_not_called()
 
+    def test_crawl_one_skips_smokingpipes_without_reporting(self):
+        task = {'url': 'https://www.smokingpipes.com/pipe-tobacco/sample/product_id/1'}
+
+        with patch('runner.main.cloudscraper.create_scraper') as create_scraper_mock:
+            result = main.crawl_one(task)
+
+        self.assertFalse(result['fetch_ok'])
+        self.assertTrue(result['skip_update'])
+        self.assertEqual(result['reason'], 'skipped_smokingpipes')
+        create_scraper_mock.assert_not_called()
+
+    def test_decrypt_pipeuncle_payload_uses_known_aes_key(self):
+        payload = json.dumps({'totalStock': 2, 'sellPrice': 20.15}).encode('utf-8')
+        pad_size = AES.block_size - (len(payload) % AES.block_size)
+        cipher_text = AES.new(main.PIPEUNCLE_AES_KEY, AES.MODE_ECB).encrypt(payload + bytes([pad_size]) * pad_size)
+        encoded = base64.b64encode(cipher_text).decode('ascii')
+
+        detail = main._decrypt_pipeuncle_payload(encoded)
+
+        self.assertEqual(detail['totalStock'], 2)
+        self.assertEqual(detail['sellPrice'], 20.15)
+
+    def test_crawl_one_fetches_pipeuncle_via_api_without_selenium(self):
+        task = {'url': 'https://www.pipeuncle.com/detail/goods?id=261'}
+        payload = json.dumps({'totalStock': 3, 'sellPrice': 20.15}).encode('utf-8')
+        pad_size = AES.block_size - (len(payload) % AES.block_size)
+        cipher_text = AES.new(main.PIPEUNCLE_AES_KEY, AES.MODE_ECB).encrypt(payload + bytes([pad_size]) * pad_size)
+        encoded = base64.b64encode(cipher_text).decode('ascii')
+        response = Mock(status_code=200)
+        response.json.return_value = {'code': 200, 'data': encoded}
+
+        with patch('runner.main.curl_requests.get', return_value=response) as curl_get_mock:
+            with patch.object(main.STRATEGY_RUNTIME, 'requires_selenium') as requires_selenium_mock:
+                with patch('runner.main.cloudscraper.create_scraper') as create_scraper_mock:
+                    result = main.crawl_one(task)
+
+        self.assertTrue(result['fetch_ok'])
+        self.assertTrue(result['in_stock'])
+        self.assertEqual(result['price'], '$20.15')
+        requires_selenium_mock.assert_not_called()
+        create_scraper_mock.assert_not_called()
+        curl_get_mock.assert_called_once()
+
+    def test_process_task_page_reports_only_reportable_results_and_logs_issues(self):
+        results = [
+            {'url': 'https://www.smokingpipes.com/p/1', 'fetch_ok': False, 'in_stock': False, 'price': '', 'reason': 'skipped_smokingpipes', 'skip_update': True},
+            {'url': 'https://www.havahavana.com/p/1', 'fetch_ok': False, 'in_stock': False, 'price': '', 'reason': 'http_429'},
+            {'url': 'https://example.test/p/1', 'fetch_ok': True, 'in_stock': True, 'price': '$9.99', 'reason': ''},
+        ]
+        config = main.RunConfig(
+            tiers=['low'],
+            source_mode='all',
+            page_size=100,
+            max_workers=4,
+            refresh_on_first_pull=True,
+        )
+
+        with patch('runner.main.crawl_all', return_value=results):
+            with patch('runner.main.report_results', return_value={'updated': 2, 'push_enabled': False}) as report_mock:
+                with patch('runner.main.info') as info_mock:
+                    with patch('runner.main.warn') as warn_mock:
+                        totals = main._process_task_page('run-1', 'low', config, 0, 0, [{'url': 'https://example.test'}])
+
+        report_mock.assert_called_once_with(run_id='run-1', results=results[1:])
+        self.assertEqual(totals['total'], 3)
+        self.assertEqual(totals['reported'], 2)
+        self.assertEqual(totals['failed'], 1)
+        self.assertEqual(totals['skipped'], 1)
+        self.assertTrue(any('reported=2' in call.args[0] for call in info_mock.call_args_list))
+        self.assertTrue(any('skipped_smokingpipes=1' in call.args[0] for call in warn_mock.call_args_list))
+
     def test_main_paginates_and_runs_multiple_tiers(self):
         task_a = {'url': 'https://example.test/a'}
         task_b = {'url': 'https://example.test/b'}
@@ -108,7 +189,7 @@ class RunnerMainTests(unittest.TestCase):
         crawl_side_effect = [
             [
                 {'url': task_a['url'], 'fetch_ok': True, 'in_stock': True, 'price': '$1.00', 'reason': ''},
-                {'url': task_b['url'], 'fetch_ok': False, 'in_stock': False, 'price': '', 'reason': 'http_503'},
+                {'url': task_b['url'], 'fetch_ok': True, 'in_stock': False, 'price': '$1.20', 'reason': ''},
             ],
             [
                 {'url': task_c['url'], 'fetch_ok': True, 'in_stock': False, 'price': '$2.00', 'reason': ''},
@@ -162,6 +243,7 @@ class RunnerMainTests(unittest.TestCase):
         self.assertFalse(third_call['refresh'])
 
         self.assertTrue(any('运行结束' in call.args[0] for call in info_mock.call_args_list))
+        self.assertTrue(any('reported=' in call.args[0] for call in info_mock.call_args_list))
 
 
 if __name__ == '__main__':
