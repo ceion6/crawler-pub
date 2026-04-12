@@ -18,7 +18,7 @@ from bs4 import BeautifulSoup
 from runner.report_client import report_results
 from runner.safe_logger import error, info, warn
 from runner.strategy_runtime import StrategyRuntime
-from runner.task_client import pull_tasks
+from runner.task_client import pull_task_page
 
 
 IN_STOCK_TOKENS = ('in stock', 'available', 'add to cart', 'buy now')
@@ -26,6 +26,17 @@ OUT_OF_STOCK_TOKENS = ('out of stock', 'sold out', 'unavailable')
 PRICE_PATTERN = re.compile(r'([$€£]\s?\d+(?:[.,]\d{2})?)')
 TRANSIENT_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 STRATEGY_RUNTIME = StrategyRuntime()
+VALID_TIERS = ('low', 'high')
+VALID_SOURCE_MODES = ('all', 'subscription', 'baseline')
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    tiers: List[str]
+    source_mode: str
+    page_size: int
+    max_workers: int
+    refresh_on_first_pull: bool
 
 
 @dataclass(frozen=True)
@@ -241,30 +252,130 @@ def crawl_all(tasks: List[Dict], max_workers: int) -> List[Dict]:
     return results
 
 
+def _parse_bool(raw: str, default: bool = False) -> bool:
+    text = (raw or '').strip().lower()
+    if not text:
+        return default
+    return text in {'1', 'true', 'yes', 'y', 'on'}
+
+
+def _parse_tiers(raw: str) -> List[str]:
+    tiers: List[str] = []
+    for part in (raw or '').split(','):
+        tier = part.strip().lower()
+        if tier in VALID_TIERS and tier not in tiers:
+            tiers.append(tier)
+    return tiers or ['low']
+
+
+def _load_run_config() -> RunConfig:
+    raw_tiers = os.getenv('MONITOR_TIERS') or os.getenv('MONITOR_TIER', 'low')
+    source_mode = (os.getenv('MONITOR_SOURCE_MODE', 'all') or 'all').strip().lower()
+    if source_mode not in VALID_SOURCE_MODES:
+        source_mode = 'all'
+
+    page_size_raw = os.getenv('MONITOR_PAGE_SIZE') or os.getenv('MONITOR_TASK_LIMIT', '200')
+    page_size = max(1, int(page_size_raw))
+    max_workers = max(1, int(os.getenv('MAX_WORKERS', '12')))
+    refresh_on_first_pull = _parse_bool(os.getenv('MONITOR_REFRESH_ON_FIRST_PULL', 'true'), default=True)
+
+    return RunConfig(
+        tiers=_parse_tiers(raw_tiers),
+        source_mode=source_mode,
+        page_size=page_size,
+        max_workers=max_workers,
+        refresh_on_first_pull=refresh_on_first_pull,
+    )
+
+
+def _summarize_results(results: List[Dict]) -> Dict[str, int]:
+    ok_count = sum(1 for row in results if row.get('fetch_ok'))
+    stock_count = sum(1 for row in results if row.get('in_stock'))
+    failed_count = len(results) - ok_count
+    return {
+        'total': len(results),
+        'ok': ok_count,
+        'failed': failed_count,
+        'in_stock': stock_count,
+    }
+
+
+def _process_task_page(run_id: str, tier: str, config: RunConfig, page_index: int, offset: int, tasks: List[Dict]) -> Dict[str, int]:
+    info(
+        f'开始执行任务，tier={tier} source_mode={config.source_mode} '
+        f'page={page_index} offset={offset} 任务数={len(tasks)}'
+    )
+    results = crawl_all(tasks, max_workers=config.max_workers)
+    summary = _summarize_results(results)
+    payload = report_results(run_id=run_id, results=results)
+    info(
+        f'页执行完成 run_id={run_id} tier={tier} source_mode={config.source_mode} '
+        f'page={page_index} total={summary["total"]} ok={summary["ok"]} failed={summary["failed"]} '
+        f'in_stock={summary["in_stock"]} updated={payload.get("updated", 0)} '
+        f'push_enabled={payload.get("push_enabled", False)}'
+    )
+    return {
+        'total': summary['total'],
+        'ok': summary['ok'],
+        'failed': summary['failed'],
+        'in_stock': summary['in_stock'],
+        'updated': int(payload.get('updated', 0)),
+    }
+
+
 def main() -> None:
-    tier = os.getenv('MONITOR_TIER', 'low')
-    limit = int(os.getenv('MONITOR_TASK_LIMIT', '200'))
-    max_workers = int(os.getenv('MAX_WORKERS', '12'))
+    config = _load_run_config()
     run_id = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
 
     start = time.time()
     STRATEGY_RUNTIME.load()
-    tasks = pull_tasks(tier=tier, limit=limit)
-    if not tasks:
-        warn(f'任务为空，tier={tier}')
+    totals = {
+        'total': 0,
+        'ok': 0,
+        'failed': 0,
+        'in_stock': 0,
+        'updated': 0,
+    }
+    refresh_on_this_page = config.refresh_on_first_pull
+    fetched_any_task = False
+
+    for tier in config.tiers:
+        offset = 0
+        page_index = 0
+        while True:
+            payload = pull_task_page(
+                tier=tier,
+                limit=config.page_size,
+                offset=offset,
+                refresh=refresh_on_this_page,
+                source_mode=config.source_mode,
+            )
+            refresh_on_this_page = False
+            tasks = payload.get('tasks', [])
+
+            if not tasks:
+                if page_index == 0:
+                    warn(f'任务为空，tier={tier} source_mode={config.source_mode}')
+                break
+
+            fetched_any_task = True
+            page_totals = _process_task_page(run_id, tier, config, page_index, offset, tasks)
+            for key in totals:
+                totals[key] += page_totals[key]
+
+            batch_size = len(tasks)
+            offset += batch_size
+            page_index += 1
+            if batch_size < config.page_size:
+                break
+
+    if not fetched_any_task:
         return
 
-    info(f'开始执行任务，tier={tier}，任务数={len(tasks)}')
-    results = crawl_all(tasks, max_workers=max_workers)
-    ok_count = sum(1 for r in results if r.get('fetch_ok'))
-    stock_count = sum(1 for r in results if r.get('in_stock'))
-    failed_count = len(results) - ok_count
-
-    payload = report_results(run_id=run_id, results=results)
     elapsed = time.time() - start
     info(
-        f'运行结束 run_id={run_id} total={len(results)} ok={ok_count} failed={failed_count} in_stock={stock_count} '
-        f'updated={payload.get("updated", 0)} push_enabled={payload.get("push_enabled", False)} '
+        f'运行结束 run_id={run_id} total={totals["total"]} ok={totals["ok"]} '
+        f'failed={totals["failed"]} in_stock={totals["in_stock"]} updated={totals["updated"]} '
         f'elapsed={elapsed:.1f}s'
     )
 

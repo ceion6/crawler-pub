@@ -1,8 +1,8 @@
-name: Hourly Subscription Crawl
+name: Daily Full Crawl
 
 on:
   schedule:
-    - cron: '7 * * * *'
+    - cron: '20 2 * * *'
   workflow_dispatch:
     inputs:
       tiers:
@@ -14,7 +14,6 @@ on:
         required: false
         default: '100'
 
-# 提前启用 Node.js 24 运行时，消除 Node.js 20 弃用警告
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -22,13 +21,13 @@ permissions:
   contents: read
 
 concurrency:
-  group: hourly-subscription-crawl
+  group: daily-full-crawl
   cancel-in-progress: false
 
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 120
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -38,7 +37,6 @@ jobs:
         with:
           python-version: '3.11'
 
-      # pip 缓存加速依赖安装
       - name: Cache pip dependencies
         uses: actions/cache@v4
         with:
@@ -47,7 +45,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      # 验证 Chrome 环境（ubuntu-latest 预装）
       - name: Verify Chrome environment
         run: |
           google-chrome --version
@@ -58,13 +55,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run crawler
+      - name: Run full crawler
         env:
           MONITOR_API_BASE_URL: ${{ secrets.MONITOR_API_BASE_URL }}
           MONITOR_API_CLIENT_ID: ${{ secrets.MONITOR_API_CLIENT_ID }}
           MONITOR_API_SECRET: ${{ secrets.MONITOR_API_SECRET }}
           MONITOR_TIERS: ${{ github.event.inputs.tiers || 'low,high' }}
-          MONITOR_SOURCE_MODE: subscription
+          MONITOR_SOURCE_MODE: all
           MONITOR_PAGE_SIZE: ${{ github.event.inputs.page_size || '100' }}
           MAX_WORKERS: 12
         run: python -m runner.main
