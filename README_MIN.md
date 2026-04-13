@@ -5,7 +5,7 @@ Public execution runner for scheduled crawl jobs.
 ## Workflows
 
 - `crawl_runner.yml`: 每小时执行一次 VIP 订阅相关链接抓取，使用 `source_mode=subscription`
-- `daily_full_crawl.yml`: 每天执行一次全量价格/库存轮询，使用 `source_mode=all`
+- `daily_full_crawl.yml`: 每天执行一次 listings 目录轮询，使用 `source_mode=catalog`
 
 ## Required Secrets
 
@@ -17,7 +17,8 @@ Public execution runner for scheduled crawl jobs.
 
 - `MAX_WORKERS`: 全局线程池大小，默认由调度环境传入
 - `MONITOR_TIERS`: 风险层级列表，逗号分隔，支持 `low,high`
-- `MONITOR_SOURCE_MODE`: 任务来源范围，支持 `subscription` / `baseline` / `all`
+- `MONITOR_SOURCE_MODE`: 任务来源范围，支持 `subscription` / `baseline` / `all` / `catalog`
+- `MONITOR_RESULT_MODE`: 结果上报模式，支持 `subscription` / `catalog`
 - `MONITOR_PAGE_SIZE`: 每次向私有服务拉取的分页大小
 - `MONITOR_REFRESH_ON_FIRST_PULL`: 首次拉任务时是否要求私有服务刷新目标集，默认 `true`
 - `HOST_POLICY_JSON`: 可选的 host 级限流/重试配置，JSON 对象格式

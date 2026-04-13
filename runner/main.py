@@ -31,7 +31,8 @@ PRICE_PATTERN = re.compile(r'([$€£]\s?\d+(?:[.,]\d{2})?)')
 TRANSIENT_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 STRATEGY_RUNTIME = StrategyRuntime()
 VALID_TIERS = ('low', 'high')
-VALID_SOURCE_MODES = ('all', 'subscription', 'baseline')
+VALID_SOURCE_MODES = ('all', 'subscription', 'baseline', 'catalog')
+VALID_RESULT_MODES = ('subscription', 'catalog')
 SKIPPED_HOSTS = {
     'smokingpipes.com',
     'www.smokingpipes.com',
@@ -44,6 +45,10 @@ PIPEUNCLE_AES_KEY = b'0f5ef28c56b64e67'
 TLS_IMPERSONATION_HOSTS = {
     'smokingpipes.com',
     'www.smokingpipes.com',
+    '4noggins.com',
+    'www.4noggins.com',
+    '70cigars.com',
+    'www.70cigars.com',
     'cgarsltd.co.uk',
     'www.cgarsltd.co.uk',
     'havahavana.com',
@@ -51,12 +56,24 @@ TLS_IMPERSONATION_HOSTS = {
     'tobaccolifestyle.com',
     'www.tobaccolifestyle.com',
 }
+HOST_IMPERSONATION_FALLBACKS = {
+    'cgarsltd.co.uk': ('chrome136', 'edge101'),
+    'www.cgarsltd.co.uk': ('chrome136', 'edge101'),
+}
+DEFAULT_REQUEST_HEADERS = {
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Cache-Control': 'no-cache',
+    'Pragma': 'no-cache',
+    'Upgrade-Insecure-Requests': '1',
+}
 
 
 @dataclass(frozen=True)
 class RunConfig:
     tiers: List[str]
     source_mode: str
+    result_mode: str
     page_size: int
     max_workers: int
     refresh_on_first_pull: bool
@@ -73,8 +90,12 @@ class HostPolicy:
 
 DEFAULT_HOST_POLICY = HostPolicy()
 DEFAULT_HOST_POLICY_OVERRIDES = {
-    '4noggins.com': HostPolicy(max_parallel=1, min_interval_seconds=2.0, max_attempts=4, backoff_base_seconds=2.0),
-    'www.4noggins.com': HostPolicy(max_parallel=1, min_interval_seconds=2.0, max_attempts=4, backoff_base_seconds=2.0),
+    '4noggins.com': HostPolicy(max_parallel=1, min_interval_seconds=5.0, max_attempts=4, backoff_base_seconds=2.5),
+    'www.4noggins.com': HostPolicy(max_parallel=1, min_interval_seconds=5.0, max_attempts=4, backoff_base_seconds=2.5),
+    '70cigars.com': HostPolicy(max_parallel=1, min_interval_seconds=3.0, max_attempts=4, backoff_base_seconds=2.0),
+    'www.70cigars.com': HostPolicy(max_parallel=1, min_interval_seconds=3.0, max_attempts=4, backoff_base_seconds=2.0),
+    'cgarsltd.co.uk': HostPolicy(max_parallel=1, min_interval_seconds=2.5, max_attempts=3, backoff_base_seconds=2.0),
+    'www.cgarsltd.co.uk': HostPolicy(max_parallel=1, min_interval_seconds=2.5, max_attempts=3, backoff_base_seconds=2.0),
     'dreamingpipes.com': HostPolicy(max_parallel=1, min_interval_seconds=1.5, max_attempts=4, backoff_base_seconds=2.0),
     'www.dreamingpipes.com': HostPolicy(max_parallel=1, min_interval_seconds=1.5, max_attempts=4, backoff_base_seconds=2.0),
     'havahavana.com': HostPolicy(max_parallel=1, min_interval_seconds=2.5, max_attempts=4, backoff_base_seconds=2.0),
@@ -358,10 +379,22 @@ def _build_http_client(host: str):
 
 
 def _request_with_headers(scraper, url: str, headers: Dict[str, str], use_impersonation: bool):
+    request_headers = dict(DEFAULT_REQUEST_HEADERS)
+    request_headers.update(headers or {})
     if use_impersonation:
+        host = _normalize_host(url)
         impersonate = os.getenv('MONITOR_HTTP_IMPERSONATE', 'chrome120').strip() or 'chrome120'
-        return scraper.get(url, timeout=20, headers=headers, impersonate=impersonate)
-    return scraper.get(url, timeout=20, headers=headers)
+        variants = [impersonate]
+        for candidate in HOST_IMPERSONATION_FALLBACKS.get(host, ()):
+            if candidate not in variants:
+                variants.append(candidate)
+        response = None
+        for candidate in variants:
+            response = scraper.get(url, timeout=20, headers=request_headers, impersonate=candidate)
+            if response.status_code != 403:
+                return response
+        return response
+    return scraper.get(url, timeout=20, headers=request_headers)
 
 
 def _request_once(scraper, url: str, gate: Optional[HostGate], headers: Optional[Dict[str, str]] = None):
@@ -473,6 +506,9 @@ def _load_run_config() -> RunConfig:
     source_mode = (os.getenv('MONITOR_SOURCE_MODE', 'all') or 'all').strip().lower()
     if source_mode not in VALID_SOURCE_MODES:
         source_mode = 'all'
+    result_mode = (os.getenv('MONITOR_RESULT_MODE', '') or '').strip().lower()
+    if result_mode not in VALID_RESULT_MODES:
+        result_mode = 'catalog' if source_mode == 'catalog' else 'subscription'
 
     page_size_raw = os.getenv('MONITOR_PAGE_SIZE') or os.getenv('MONITOR_TASK_LIMIT', '200')
     page_size = max(1, int(page_size_raw))
@@ -482,6 +518,7 @@ def _load_run_config() -> RunConfig:
     return RunConfig(
         tiers=_parse_tiers(raw_tiers),
         source_mode=source_mode,
+        result_mode=result_mode,
         page_size=page_size,
         max_workers=max_workers,
         refresh_on_first_pull=refresh_on_first_pull,
@@ -542,7 +579,7 @@ def _process_task_page(run_id: str, tier: str, config: RunConfig, page_index: in
     reportable_results = [row for row in results if not _is_skip_result(row)]
     payload = {'updated': 0, 'push_enabled': False}
     if reportable_results:
-        payload = report_results(run_id=run_id, results=reportable_results)
+        payload = report_results(run_id=run_id, results=reportable_results, result_mode=config.result_mode)
     info(
         f'页执行完成 run_id={run_id} tier={tier} source_mode={config.source_mode} '
         f'page={page_index} total={summary["total"]} reported={summary["reported"]} '

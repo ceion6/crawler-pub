@@ -65,6 +65,7 @@ jobs:
           MONITOR_API_SECRET: ${{ secrets.MONITOR_API_SECRET }}
           MONITOR_TIERS: ${{ github.event.inputs.tiers || 'low,high' }}
           MONITOR_SOURCE_MODE: subscription
+          MONITOR_RESULT_MODE: subscription
           MONITOR_PAGE_SIZE: ${{ github.event.inputs.page_size || '100' }}
           MAX_WORKERS: 12
         run: python -m runner.main

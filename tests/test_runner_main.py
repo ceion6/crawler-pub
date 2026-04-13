@@ -35,7 +35,7 @@ class RunnerMainTests(unittest.TestCase):
         self.assertEqual(main._compute_retry_delay(1, policy, response=response), 7.0)
 
     def test_crawl_one_retries_transient_status_then_succeeds(self):
-        task = {'url': 'https://www.4noggins.com/products/sample'}
+        task = {'url': 'https://example.test/products/sample'}
         policy = main.HostPolicy(max_parallel=1, min_interval_seconds=0.0, max_attempts=3, backoff_base_seconds=0.1, backoff_cap_seconds=0.2)
         host = main._normalize_host(task['url'])
         host_gates = {host: main.HostGate(policy)}
@@ -57,7 +57,7 @@ class RunnerMainTests(unittest.TestCase):
         sleep_mock.assert_called()
 
     def test_crawl_one_keeps_failure_shape_after_retry_exhausted(self):
-        task = {'url': 'https://www.4noggins.com/products/sample'}
+        task = {'url': 'https://example.test/products/sample'}
         policy = main.HostPolicy(max_parallel=1, min_interval_seconds=0.0, max_attempts=3, backoff_base_seconds=0.1, backoff_cap_seconds=0.2)
         host = main._normalize_host(task['url'])
         host_gates = {host: main.HostGate(policy)}
@@ -86,6 +86,23 @@ class RunnerMainTests(unittest.TestCase):
 
         self.assertEqual(client, 'curl-session')
         curl_session_mock.assert_called_once()
+
+    def test_request_with_headers_retries_alternate_impersonation_for_cgars_403(self):
+        scraper = Mock()
+        scraper.get.side_effect = [
+            FakeResponse(403, '<html>blocked</html>'),
+            FakeResponse(200, '<html>ok</html>'),
+        ]
+
+        response = main._request_with_headers(
+            scraper,
+            'https://www.cgarsltd.co.uk/product/sample',
+            headers={},
+            use_impersonation=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(scraper.get.call_count, 2)
 
     def test_crawl_one_short_circuits_http_for_selenium_strategy(self):
         task = {'url': 'https://selenium-only.example.test/product/1'}
@@ -157,6 +174,7 @@ class RunnerMainTests(unittest.TestCase):
         config = main.RunConfig(
             tiers=['low'],
             source_mode='all',
+            result_mode='subscription',
             page_size=100,
             max_workers=4,
             refresh_on_first_pull=True,
@@ -168,7 +186,7 @@ class RunnerMainTests(unittest.TestCase):
                     with patch('runner.main.warn') as warn_mock:
                         totals = main._process_task_page('run-1', 'low', config, 0, 0, [{'url': 'https://example.test'}])
 
-        report_mock.assert_called_once_with(run_id='run-1', results=results[1:])
+        report_mock.assert_called_once_with(run_id='run-1', results=results[1:], result_mode='subscription')
         self.assertEqual(totals['total'], 3)
         self.assertEqual(totals['reported'], 2)
         self.assertEqual(totals['failed'], 1)
@@ -244,6 +262,21 @@ class RunnerMainTests(unittest.TestCase):
 
         self.assertTrue(any('运行结束' in call.args[0] for call in info_mock.call_args_list))
         self.assertTrue(any('reported=' in call.args[0] for call in info_mock.call_args_list))
+
+    def test_load_run_config_defaults_catalog_result_mode_for_catalog_source(self):
+        with patch.dict(
+            'os.environ',
+            {
+                'MONITOR_SOURCE_MODE': 'catalog',
+                'MONITOR_TIERS': 'low',
+                'MONITOR_PAGE_SIZE': '50',
+            },
+            clear=False,
+        ):
+            config = main._load_run_config()
+
+        self.assertEqual(config.source_mode, 'catalog')
+        self.assertEqual(config.result_mode, 'catalog')
 
 
 if __name__ == '__main__':
