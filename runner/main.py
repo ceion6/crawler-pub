@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import os
 import re
 import time
@@ -77,6 +78,8 @@ class RunConfig:
     page_size: int
     max_workers: int
     refresh_on_first_pull: bool
+    shard_total: int
+    shard_index: int
 
 
 @dataclass(frozen=True)
@@ -501,6 +504,42 @@ def _parse_tiers(raw: str) -> List[str]:
     return tiers or ['low']
 
 
+def _parse_shard_config() -> Tuple[int, int]:
+    shard_total = max(1, int(os.getenv('MONITOR_SHARD_TOTAL', '1')))
+    shard_index = int(os.getenv('MONITOR_SHARD_INDEX', '0'))
+    if shard_index < 0 or shard_index >= shard_total:
+        raise ValueError(f'MONITOR_SHARD_INDEX 超出范围: index={shard_index} total={shard_total}')
+    return shard_total, shard_index
+
+
+def _task_shard_key(task: Dict) -> str:
+    url = str(task.get('url', '') or '').strip()
+    if url:
+        return url
+    payload = {
+        'product_name': str(task.get('product_name', '') or ''),
+        'site_name': str(task.get('site_name', '') or ''),
+        'brand': str(task.get('brand', '') or ''),
+        'category': str(task.get('category', '') or ''),
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+
+
+def _task_belongs_to_shard(task: Dict, shard_total: int, shard_index: int) -> bool:
+    if shard_total <= 1:
+        return True
+    key = _task_shard_key(task).encode('utf-8')
+    digest = hashlib.sha256(key).digest()
+    bucket = int.from_bytes(digest[:8], 'big') % shard_total
+    return bucket == shard_index
+
+
+def _filter_tasks_for_shard(tasks: List[Dict], shard_total: int, shard_index: int) -> List[Dict]:
+    if shard_total <= 1:
+        return list(tasks)
+    return [task for task in tasks if _task_belongs_to_shard(task, shard_total, shard_index)]
+
+
 def _load_run_config() -> RunConfig:
     raw_tiers = os.getenv('MONITOR_TIERS') or os.getenv('MONITOR_TIER', 'low')
     source_mode = (os.getenv('MONITOR_SOURCE_MODE', 'all') or 'all').strip().lower()
@@ -514,6 +553,7 @@ def _load_run_config() -> RunConfig:
     page_size = max(1, int(page_size_raw))
     max_workers = max(1, int(os.getenv('MAX_WORKERS', '12')))
     refresh_on_first_pull = _parse_bool(os.getenv('MONITOR_REFRESH_ON_FIRST_PULL', 'true'), default=True)
+    shard_total, shard_index = _parse_shard_config()
 
     return RunConfig(
         tiers=_parse_tiers(raw_tiers),
@@ -522,6 +562,8 @@ def _load_run_config() -> RunConfig:
         page_size=page_size,
         max_workers=max_workers,
         refresh_on_first_pull=refresh_on_first_pull,
+        shard_total=shard_total,
+        shard_index=shard_index,
     )
 
 
@@ -569,11 +611,26 @@ def _log_issue_summary(scope: str, run_id: str, tier: str, source_mode: str, pag
 
 
 def _process_task_page(run_id: str, tier: str, config: RunConfig, page_index: int, offset: int, tasks: List[Dict]) -> Dict[str, object]:
+    filtered_tasks = _filter_tasks_for_shard(tasks, config.shard_total, config.shard_index)
     info(
         f'开始执行任务，tier={tier} source_mode={config.source_mode} '
-        f'page={page_index} offset={offset} 任务数={len(tasks)}'
+        f'page={page_index} offset={offset} shard={config.shard_index + 1}/{config.shard_total} '
+        f'原始任务数={len(tasks)} 分片任务数={len(filtered_tasks)}'
     )
-    results = crawl_all(tasks, max_workers=config.max_workers)
+    if not filtered_tasks:
+        return {
+            'total': 0,
+            'reported': 0,
+            'ok': 0,
+            'failed': 0,
+            'skipped': 0,
+            'in_stock': 0,
+            'updated': 0,
+            'reason_counts': Counter(),
+            'host_counts': Counter(),
+        }
+
+    results = crawl_all(filtered_tasks, max_workers=config.max_workers)
     summary = _summarize_results(results)
     reason_counts, host_counts = _summarize_issues(results)
     reportable_results = [row for row in results if not _is_skip_result(row)]
@@ -582,7 +639,8 @@ def _process_task_page(run_id: str, tier: str, config: RunConfig, page_index: in
         payload = report_results(run_id=run_id, results=reportable_results, result_mode=config.result_mode)
     info(
         f'页执行完成 run_id={run_id} tier={tier} source_mode={config.source_mode} '
-        f'page={page_index} total={summary["total"]} reported={summary["reported"]} '
+        f'page={page_index} shard={config.shard_index + 1}/{config.shard_total} '
+        f'total={summary["total"]} reported={summary["reported"]} '
         f'ok={summary["ok"]} failed={summary["failed"]} skipped={summary["skipped"]} '
         f'in_stock={summary["in_stock"]} updated={payload.get("updated", 0)} '
         f'push_enabled={payload.get("push_enabled", False)}'
@@ -607,6 +665,11 @@ def main() -> None:
 
     start = time.time()
     STRATEGY_RUNTIME.load()
+    info(
+        f'运行配置 tiers={",".join(config.tiers)} source_mode={config.source_mode} '
+        f'result_mode={config.result_mode} page_size={config.page_size} '
+        f'max_workers={config.max_workers} shard={config.shard_index + 1}/{config.shard_total}'
+    )
     totals = {
         'total': 0,
         'reported': 0,

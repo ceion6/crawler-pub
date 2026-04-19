@@ -178,6 +178,8 @@ class RunnerMainTests(unittest.TestCase):
             page_size=100,
             max_workers=4,
             refresh_on_first_pull=True,
+            shard_total=1,
+            shard_index=0,
         )
 
         with patch('runner.main.crawl_all', return_value=results):
@@ -193,6 +195,50 @@ class RunnerMainTests(unittest.TestCase):
         self.assertEqual(totals['skipped'], 1)
         self.assertTrue(any('reported=2' in call.args[0] for call in info_mock.call_args_list))
         self.assertTrue(any('skipped_smokingpipes=1' in call.args[0] for call in warn_mock.call_args_list))
+
+    def test_filter_tasks_for_shard_is_deterministic(self):
+        tasks = [
+            {'url': 'https://example.test/a'},
+            {'url': 'https://example.test/b'},
+            {'url': 'https://example.test/c'},
+            {'url': 'https://example.test/d'},
+        ]
+
+        shard_zero = main._filter_tasks_for_shard(tasks, shard_total=3, shard_index=0)
+        shard_zero_again = main._filter_tasks_for_shard(tasks, shard_total=3, shard_index=0)
+        shard_one = main._filter_tasks_for_shard(tasks, shard_total=3, shard_index=1)
+        shard_two = main._filter_tasks_for_shard(tasks, shard_total=3, shard_index=2)
+
+        self.assertEqual(shard_zero, shard_zero_again)
+        self.assertEqual(
+            sorted(task['url'] for task in tasks),
+            sorted(task['url'] for task in shard_zero + shard_one + shard_two),
+        )
+        self.assertEqual(len(tasks), len(shard_zero) + len(shard_one) + len(shard_two))
+
+    def test_process_task_page_skips_empty_shard_without_crawling(self):
+        config = main.RunConfig(
+            tiers=['low'],
+            source_mode='catalog',
+            result_mode='catalog',
+            page_size=100,
+            max_workers=4,
+            refresh_on_first_pull=True,
+            shard_total=2,
+            shard_index=0,
+        )
+        task = {'url': 'https://example.test/nonmatching'}
+        while main._task_belongs_to_shard(task, config.shard_total, config.shard_index):
+            task['url'] += '-x'
+
+        with patch('runner.main.crawl_all') as crawl_mock:
+            with patch('runner.main.report_results') as report_mock:
+                totals = main._process_task_page('run-1', 'low', config, 0, 0, [task])
+
+        crawl_mock.assert_not_called()
+        report_mock.assert_not_called()
+        self.assertEqual(totals['total'], 0)
+        self.assertEqual(totals['reported'], 0)
 
     def test_main_paginates_and_runs_multiple_tiers(self):
         task_a = {'url': 'https://example.test/a'}
@@ -277,6 +323,22 @@ class RunnerMainTests(unittest.TestCase):
 
         self.assertEqual(config.source_mode, 'catalog')
         self.assertEqual(config.result_mode, 'catalog')
+
+    def test_load_run_config_reads_shard_settings(self):
+        with patch.dict(
+            'os.environ',
+            {
+                'MONITOR_SOURCE_MODE': 'catalog',
+                'MONITOR_TIERS': 'low',
+                'MONITOR_SHARD_TOTAL': '3',
+                'MONITOR_SHARD_INDEX': '2',
+            },
+            clear=False,
+        ):
+            config = main._load_run_config()
+
+        self.assertEqual(config.shard_total, 3)
+        self.assertEqual(config.shard_index, 2)
 
 
 if __name__ == '__main__':
