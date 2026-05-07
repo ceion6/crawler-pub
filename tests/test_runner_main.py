@@ -104,6 +104,25 @@ class RunnerMainTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(scraper.get.call_count, 2)
 
+    def test_request_with_headers_skips_unsupported_impersonation_profile(self):
+        scraper = Mock()
+        scraper.get.side_effect = [
+            RuntimeError('unsupported profile'),
+            FakeResponse(200, '<html>ok</html>'),
+        ]
+
+        with patch('runner.main.warn') as warn_mock:
+            response = main._request_with_headers(
+                scraper,
+                'https://www.cgarsltd.co.uk/product/sample',
+                headers={},
+                use_impersonation=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(scraper.get.call_count, 2)
+        self.assertTrue(any('profile=chrome' in call.args[0] for call in warn_mock.call_args_list))
+
     def test_crawl_one_short_circuits_http_for_selenium_strategy(self):
         task = {'url': 'https://selenium-only.example.test/product/1'}
 

@@ -58,8 +58,8 @@ TLS_IMPERSONATION_HOSTS = {
     'www.tobaccolifestyle.com',
 }
 HOST_IMPERSONATION_FALLBACKS = {
-    'cgarsltd.co.uk': ('chrome136', 'edge101'),
-    'www.cgarsltd.co.uk': ('chrome136', 'edge101'),
+    'cgarsltd.co.uk': ('chrome', 'chrome136', 'chrome131', 'chrome124', 'edge101'),
+    'www.cgarsltd.co.uk': ('chrome', 'chrome136', 'chrome131', 'chrome124', 'edge101'),
 }
 DEFAULT_REQUEST_HEADERS = {
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -386,17 +386,27 @@ def _request_with_headers(scraper, url: str, headers: Dict[str, str], use_impers
     request_headers.update(headers or {})
     if use_impersonation:
         host = _normalize_host(url)
-        impersonate = os.getenv('MONITOR_HTTP_IMPERSONATE', 'chrome120').strip() or 'chrome120'
+        impersonate = os.getenv('MONITOR_HTTP_IMPERSONATE', 'chrome').strip() or 'chrome'
         variants = [impersonate]
         for candidate in HOST_IMPERSONATION_FALLBACKS.get(host, ()):
             if candidate not in variants:
                 variants.append(candidate)
         response = None
+        last_exception = None
         for candidate in variants:
-            response = scraper.get(url, timeout=20, headers=request_headers, impersonate=candidate)
+            try:
+                response = scraper.get(url, timeout=20, headers=request_headers, impersonate=candidate)
+            except Exception as exc:
+                last_exception = exc
+                warn(f'TLS impersonation profile failed host={host} profile={candidate} exception={type(exc).__name__}')
+                continue
             if response.status_code != 403:
                 return response
-        return response
+        if response is not None:
+            return response
+        if last_exception is not None:
+            raise last_exception
+        raise RuntimeError('all_impersonation_profiles_failed')
     return scraper.get(url, timeout=20, headers=request_headers)
 
 
