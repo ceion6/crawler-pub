@@ -184,6 +184,18 @@ class RunnerMainTests(unittest.TestCase):
         create_scraper_mock.assert_not_called()
         curl_get_mock.assert_called_once()
 
+    def test_crawl_one_maps_missing_pipeuncle_product_to_out_of_stock(self):
+        task = {'url': 'https://www.pipeuncle.com/detail/goods?id=2239'}
+        response = Mock(status_code=200)
+        response.json.return_value = {'code': 314, 'msg': '商品不存在!'}
+
+        with patch('runner.main.curl_requests.get', return_value=response):
+            result = main.crawl_one(task)
+
+        self.assertTrue(result['fetch_ok'])
+        self.assertFalse(result['in_stock'])
+        self.assertEqual(result['reason'], 'pipeuncle_product_missing')
+
     def test_process_task_page_reports_only_reportable_results_and_logs_issues(self):
         results = [
             {'url': 'https://www.smokingpipes.com/p/1', 'fetch_ok': False, 'in_stock': False, 'price': '', 'reason': 'skipped_smokingpipes', 'skip_update': True},

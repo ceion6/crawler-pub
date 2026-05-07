@@ -262,6 +262,15 @@ def _crawl_pipeuncle_via_api(url: str, gate: Optional[HostGate] = None) -> Dict:
             'reason': f'pipeuncle_json_error:{type(exc).__name__}',
         }
 
+    if payload.get('code') == 314:
+        return {
+            'url': url,
+            'fetch_ok': True,
+            'in_stock': False,
+            'price': '',
+            'reason': 'pipeuncle_product_missing',
+        }
+
     if payload.get('code') != 200:
         return {
             'url': url,
