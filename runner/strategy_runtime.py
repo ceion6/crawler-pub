@@ -107,6 +107,23 @@ class StrategyRuntime:
 
         soup = BeautifulSoup(html, 'lxml')
         text_content = soup.get_text(' ', strip=True).lower()
+        page_complete = getattr(strategy, 'is_page_complete', None)
+        if callable(page_complete):
+            try:
+                if not page_complete(soup, url, text_content):
+                    return {
+                        'fetch_ok': False,
+                        'in_stock': False,
+                        'price': '',
+                        'reason': 'incomplete_product_page',
+                    }
+            except Exception as exc:
+                return {
+                    'fetch_ok': False,
+                    'in_stock': False,
+                    'price': '',
+                    'reason': f'page_complete_error:{type(exc).__name__}',
+                }
         in_stock = bool(strategy.check_stock(soup, url, text_content))
         try:
             price = strategy.extract_price(soup, url, normalized_task) or ''
