@@ -56,6 +56,8 @@ TLS_IMPERSONATION_HOSTS = {
     'www.havahavana.com',
     'tobaccolifestyle.com',
     'www.tobaccolifestyle.com',
+    'pipemoment.com',
+    'www.pipemoment.com',
 }
 HOST_IMPERSONATION_FALLBACKS = {
     'cgarsltd.co.uk': ('chrome', 'chrome136', 'chrome131', 'chrome124', 'edge101'),
@@ -107,6 +109,8 @@ DEFAULT_HOST_POLICY_OVERRIDES = {
     'www.pipeuncle.com': HostPolicy(max_parallel=1, min_interval_seconds=1.0, max_attempts=3, backoff_base_seconds=1.5),
     'tobaccolifestyle.com': HostPolicy(max_parallel=1, min_interval_seconds=2.5, max_attempts=4, backoff_base_seconds=2.0),
     'www.tobaccolifestyle.com': HostPolicy(max_parallel=1, min_interval_seconds=2.5, max_attempts=4, backoff_base_seconds=2.0),
+    'pipemoment.com': HostPolicy(max_parallel=1, min_interval_seconds=1.5, max_attempts=4, backoff_base_seconds=1.5),
+    'www.pipemoment.com': HostPolicy(max_parallel=1, min_interval_seconds=1.5, max_attempts=4, backoff_base_seconds=1.5),
 }
 
 
