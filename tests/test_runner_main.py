@@ -348,6 +348,32 @@ class RunnerMainTests(unittest.TestCase):
         self.assertEqual(result['price'], '$12.90')
         self.assertEqual(result['reason'], '')
 
+    def test_crawl_one_retries_pipemoment_product_json_after_rate_limit(self):
+        task = {'url': 'https://pipemoment.com/en/products/gawith-hoggarth-rodeo-50g'}
+        limited_response = Mock(status_code=429, headers={})
+        success_response = Mock(status_code=200, headers={})
+        success_response.json.return_value = {
+            'handle': 'gawith-hoggarth-rodeo-50g',
+            'variants': [{'id': 1, 'available': True, 'price': 1290}],
+        }
+
+        with patch(
+            'runner.main.curl_requests.get',
+            side_effect=[
+                limited_response,
+                limited_response,
+                limited_response,
+                success_response,
+            ],
+        ) as curl_get_mock:
+            with patch('runner.main.time.sleep') as sleep_mock:
+                result = main.crawl_one(task)
+
+        self.assertEqual(curl_get_mock.call_count, 4)
+        self.assertEqual(sleep_mock.call_count, 3)
+        self.assertTrue(result['fetch_ok'])
+        self.assertEqual(result['price'], '$12.90')
+
     def test_crawl_one_falls_back_to_pipemoment_ucp_and_matches_brand_prefix(self):
         task = {'url': 'https://pipemoment.com/en/products/salty-dogs-50g'}
         json_response = Mock(status_code=404, headers={})

@@ -524,6 +524,7 @@ def _crawl_shopify_via_ucp(
 def _crawl_pipemoment_via_product_json(
     url: str,
     gate: Optional[HostGate] = None,
+    policy: Optional[HostPolicy] = None,
 ) -> Optional[Dict]:
     parsed = urlparse(url)
     path_parts = [part for part in parsed.path.split('/') if part]
@@ -536,8 +537,9 @@ def _crawl_pipemoment_via_product_json(
     product_url = f'{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip("/")}.js'
     headers = {'Accept': 'application/json'}
     impersonate = os.getenv('MONITOR_HTTP_IMPERSONATE', 'chrome').strip() or 'chrome'
+    request_policy = policy or DEFAULT_HOST_POLICY_OVERRIDES['pipemoment.com']
     response = None
-    for attempt in range(1, 3):
+    for attempt in range(1, request_policy.max_attempts + 1):
         if gate is not None:
             gate.acquire()
         try:
@@ -548,16 +550,19 @@ def _crawl_pipemoment_via_product_json(
                 impersonate=impersonate,
             )
         except Exception:
-            if attempt < 2:
-                time.sleep(1.0)
+            if attempt < request_policy.max_attempts:
+                time.sleep(_compute_retry_delay(attempt, request_policy))
                 continue
             return None
         finally:
             if gate is not None:
                 gate.release()
 
-        if response.status_code in TRANSIENT_STATUS_CODES and attempt < 2:
-            time.sleep(1.0)
+        if (
+            response.status_code in TRANSIENT_STATUS_CODES
+            and attempt < request_policy.max_attempts
+        ):
+            time.sleep(_compute_retry_delay(attempt, request_policy, response=response))
             continue
         break
 
@@ -780,7 +785,12 @@ def crawl_one(
             gate=host_gate,
         )
     if host in PIPEMOMENT_HOSTS:
-        product_json_result = _crawl_pipemoment_via_product_json(url, gate=host_gate)
+        pipemoment_policy = _resolve_host_policy(host, host_policy_overrides)
+        product_json_result = _crawl_pipemoment_via_product_json(
+            url,
+            gate=host_gate,
+            policy=pipemoment_policy,
+        )
         if product_json_result is not None:
             return product_json_result
         return _crawl_shopify_via_ucp(
