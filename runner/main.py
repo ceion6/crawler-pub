@@ -521,6 +521,94 @@ def _crawl_shopify_via_ucp(
     }
 
 
+def _crawl_pipemoment_via_product_json(
+    url: str,
+    gate: Optional[HostGate] = None,
+) -> Optional[Dict]:
+    parsed = urlparse(url)
+    path_parts = [part for part in parsed.path.split('/') if part]
+    try:
+        products_index = path_parts.index('products')
+        handle = path_parts[products_index + 1]
+    except (ValueError, IndexError):
+        return None
+
+    product_url = f'{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip("/")}.js'
+    headers = {'Accept': 'application/json'}
+    impersonate = os.getenv('MONITOR_HTTP_IMPERSONATE', 'chrome').strip() or 'chrome'
+    response = None
+    for attempt in range(1, 3):
+        if gate is not None:
+            gate.acquire()
+        try:
+            response = curl_requests.get(
+                product_url,
+                timeout=30,
+                headers=headers,
+                impersonate=impersonate,
+            )
+        except Exception:
+            if attempt < 2:
+                time.sleep(1.0)
+                continue
+            return None
+        finally:
+            if gate is not None:
+                gate.release()
+
+        if response.status_code in TRANSIENT_STATUS_CODES and attempt < 2:
+            time.sleep(1.0)
+            continue
+        break
+
+    if response is None or response.status_code != 200:
+        return None
+    try:
+        product = response.json()
+    except ValueError:
+        return None
+    if not isinstance(product, dict) or product.get('handle') != handle:
+        return None
+
+    variants = product.get('variants')
+    if not isinstance(variants, list) or not variants:
+        return None
+    target_variant = None
+    target_ids = parse_qs(parsed.query).get('variant', [])
+    if target_ids:
+        target_id = str(target_ids[0])
+        target_variant = next(
+            (
+                variant
+                for variant in variants
+                if isinstance(variant, dict) and str(variant.get('id')) == target_id
+            ),
+            None,
+        )
+        if target_variant is None:
+            return None
+
+    available_variants = [
+        variant
+        for variant in variants
+        if isinstance(variant, dict) and bool(variant.get('available'))
+    ]
+    selected_variant = target_variant or (
+        available_variants[0]
+        if available_variants
+        else next((variant for variant in variants if isinstance(variant, dict)), {})
+    )
+    in_stock = bool(target_variant.get('available')) if target_variant else bool(available_variants)
+    price = _format_ucp_price(selected_variant.get('price'), 'USD')
+    return {
+        'url': url,
+        'fetch_ok': True,
+        'in_stock': in_stock,
+        'price': price,
+        'reason': '',
+    }
+
+
 def _load_host_policy_overrides() -> Dict[str, HostPolicy]:
     raw = os.getenv('HOST_POLICY_JSON', '').strip()
     if not raw:
@@ -692,6 +780,9 @@ def crawl_one(
             gate=host_gate,
         )
     if host in PIPEMOMENT_HOSTS:
+        product_json_result = _crawl_pipemoment_via_product_json(url, gate=host_gate)
+        if product_json_result is not None:
+            return product_json_result
         return _crawl_shopify_via_ucp(
             url,
             PIPEMOMENT_UCP_ENDPOINT,

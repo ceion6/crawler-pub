@@ -318,10 +318,41 @@ class RunnerMainTests(unittest.TestCase):
         self.assertFalse(result['in_stock'])
         self.assertEqual(result['price'], '£25.00')
 
-    def test_crawl_one_matches_pipemoment_ucp_handle_with_brand_prefix(self):
-        task = {'url': 'https://pipemoment.com/en/products/salty-dogs-50g'}
+    def test_crawl_one_fetches_pipemoment_from_shopify_product_json(self):
+        task = {'url': 'https://pipemoment.com/en/products/gawith-hoggarth-rodeo-50g'}
         response = Mock(status_code=200, headers={})
         response.json.return_value = {
+            'handle': 'gawith-hoggarth-rodeo-50g',
+            'available': True,
+            'price': 1290,
+            'variants': [
+                {
+                    'id': 54177307033899,
+                    'available': True,
+                    'price': 1290,
+                },
+            ],
+        }
+
+        with patch('runner.main.curl_requests.get', return_value=response) as curl_get_mock:
+            with patch('runner.main.curl_requests.post') as curl_post_mock:
+                result = main.crawl_one(task)
+
+        self.assertEqual(
+            curl_get_mock.call_args.args[0],
+            'https://pipemoment.com/en/products/gawith-hoggarth-rodeo-50g.js',
+        )
+        curl_post_mock.assert_not_called()
+        self.assertTrue(result['fetch_ok'])
+        self.assertTrue(result['in_stock'])
+        self.assertEqual(result['price'], '$12.90')
+        self.assertEqual(result['reason'], '')
+
+    def test_crawl_one_falls_back_to_pipemoment_ucp_and_matches_brand_prefix(self):
+        task = {'url': 'https://pipemoment.com/en/products/salty-dogs-50g'}
+        json_response = Mock(status_code=404, headers={})
+        ucp_response = Mock(status_code=200, headers={})
+        ucp_response.json.return_value = {
             'result': {
                 'isError': False,
                 'structuredContent': {
@@ -340,8 +371,9 @@ class RunnerMainTests(unittest.TestCase):
             }
         }
 
-        with patch('runner.main.curl_requests.post', return_value=response) as curl_post_mock:
-            result = main.crawl_one(task)
+        with patch('runner.main.curl_requests.get', return_value=json_response):
+            with patch('runner.main.curl_requests.post', return_value=ucp_response) as curl_post_mock:
+                result = main.crawl_one(task)
 
         self.assertEqual(curl_post_mock.call_args.args[0], main.PIPEMOMENT_UCP_ENDPOINT)
         request_payload = curl_post_mock.call_args.kwargs['json']

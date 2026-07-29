@@ -7,6 +7,8 @@ from curl_cffi import requests as curl_requests
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 
+from runner.main import _build_host_gates, crawl_one
+
 
 URLS = {
     "robots": "https://www.smokingpipes.com/robots.txt",
@@ -113,3 +115,35 @@ try:
         )
 finally:
     driver.quit()
+
+pipemoment_tasks = [
+    {
+        "url": (
+            "https://pipemoment.com/en/products/"
+            "samuel-gawith-squadron-leader-50g"
+        )
+    },
+    {
+        "url": (
+            "https://pipemoment.com/en/products/"
+            "gawith-hoggarth-rodeo-50g"
+        )
+    },
+    {
+        "url": (
+            "https://pipemoment.com/en/products/"
+            "gawith-hoggarth-american-c-v-50g"
+        )
+    },
+]
+pipemoment_gates = _build_host_gates(pipemoment_tasks)
+for task in pipemoment_tasks:
+    print(
+        json.dumps(
+            {
+                "method": "crawler:pipemoment",
+                **crawl_one(task, host_gates=pipemoment_gates),
+            },
+            ensure_ascii=False,
+        )
+    )
