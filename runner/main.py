@@ -42,6 +42,11 @@ PIPEUNCLE_HOSTS = {
     'pipeuncle.com',
     'www.pipeuncle.com',
 }
+FOURNOGGINS_HOSTS = {
+    '4noggins.com',
+    'www.4noggins.com',
+}
+FOURNOGGINS_SHOPIFY_HOST = '4noggins-com.myshopify.com'
 PIPEUNCLE_AES_KEY = b'0f5ef28c56b64e67'
 TLS_IMPERSONATION_HOSTS = {
     'smokingpipes.com',
@@ -309,6 +314,76 @@ def _crawl_pipeuncle_via_api(url: str, gate: Optional[HostGate] = None) -> Dict:
     }
 
 
+def _crawl_fournoggins_via_shopify(url: str, gate: Optional[HostGate] = None) -> Dict:
+    path_parts = [part for part in urlparse(url).path.split('/') if part]
+    if len(path_parts) < 2 or path_parts[0] != 'products':
+        return {'url': url, 'fetch_ok': False, 'in_stock': False, 'price': '', 'reason': 'fournoggins_handle_missing'}
+
+    api_url = f'https://{FOURNOGGINS_SHOPIFY_HOST}/products/{path_parts[1]}.js'
+    headers = {
+        'Accept': 'application/json',
+        'Referer': url,
+    }
+    impersonate = os.getenv('MONITOR_HTTP_IMPERSONATE', 'chrome').strip() or 'chrome'
+
+    if gate is not None:
+        gate.acquire()
+    try:
+        response = curl_requests.get(api_url, timeout=20, headers=headers, impersonate=impersonate)
+    except Exception as exc:
+        return {
+            'url': url,
+            'fetch_ok': False,
+            'in_stock': False,
+            'price': '',
+            'reason': f'fournoggins_api_exception:{type(exc).__name__}',
+        }
+    finally:
+        if gate is not None:
+            gate.release()
+
+    if response.status_code != 200:
+        return {
+            'url': url,
+            'fetch_ok': False,
+            'in_stock': False,
+            'price': '',
+            'reason': f'fournoggins_http_{response.status_code}',
+        }
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        return {
+            'url': url,
+            'fetch_ok': False,
+            'in_stock': False,
+            'price': '',
+            'reason': f'fournoggins_json_error:{type(exc).__name__}',
+        }
+
+    variants = payload.get('variants') if isinstance(payload, dict) else []
+    variants = variants if isinstance(variants, list) else []
+    available_variants = [variant for variant in variants if isinstance(variant, dict) and variant.get('available')]
+    price_variant = available_variants[0] if available_variants else next(
+        (variant for variant in variants if isinstance(variant, dict)),
+        {},
+    )
+    price_cents = price_variant.get('price')
+    try:
+        price = _format_price(float(price_cents) / 100) if price_cents is not None else ''
+    except (TypeError, ValueError):
+        price = ''
+
+    return {
+        'url': url,
+        'fetch_ok': True,
+        'in_stock': bool(available_variants or payload.get('available')),
+        'price': price,
+        'reason': '',
+    }
+
+
 def _load_host_policy_overrides() -> Dict[str, HostPolicy]:
     raw = os.getenv('HOST_POLICY_JSON', '').strip()
     if not raw:
@@ -450,6 +525,8 @@ def crawl_one(
         return _build_skip_result(url, 'skipped_smokingpipes')
     if host in PIPEUNCLE_HOSTS:
         return _crawl_pipeuncle_via_api(url, gate=host_gate)
+    if host in FOURNOGGINS_HOSTS:
+        return _crawl_fournoggins_via_shopify(url, gate=host_gate)
 
     host_policy = _resolve_host_policy(host, host_policy_overrides)
     if STRATEGY_RUNTIME.requires_selenium(task):

@@ -152,6 +152,31 @@ class RunnerMainTests(unittest.TestCase):
         self.assertEqual(result['reason'], 'skipped_smokingpipes')
         create_scraper_mock.assert_not_called()
 
+    def test_crawl_one_fetches_fournoggins_from_shopify_product_feed(self):
+        task = {'url': 'https://4noggins.com/products/sample-blend'}
+        response = Mock(status_code=200, headers={})
+        response.json.return_value = {
+            'available': True,
+            'variants': [
+                {'available': True, 'price': 1250},
+                {'available': False, 'price': 1400},
+            ],
+        }
+
+        with patch('runner.main.curl_requests.get', return_value=response) as curl_get_mock:
+            with patch.object(main.STRATEGY_RUNTIME, 'requires_selenium') as requires_selenium_mock:
+                result = main.crawl_one(task)
+
+        self.assertEqual(
+            curl_get_mock.call_args.args[0],
+            'https://4noggins-com.myshopify.com/products/sample-blend.js',
+        )
+        self.assertTrue(result['fetch_ok'])
+        self.assertTrue(result['in_stock'])
+        self.assertEqual(result['price'], '$12.50')
+        self.assertEqual(result['url'], task['url'])
+        requires_selenium_mock.assert_not_called()
+
     def test_decrypt_pipeuncle_payload_uses_known_aes_key(self):
         payload = json.dumps({'totalStock': 2, 'sellPrice': 20.15}).encode('utf-8')
         pad_size = AES.block_size - (len(payload) % AES.block_size)
