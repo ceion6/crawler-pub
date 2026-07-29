@@ -68,4 +68,18 @@ jobs:
           MONITOR_RESULT_MODE: subscription
           MONITOR_PAGE_SIZE: ${{ github.event.inputs.page_size || '100' }}
           MAX_WORKERS: 12
-        run: python -m runner.main
+        run: |
+          python - <<'PY'
+          from runner.main import crawl_one
+
+          urls = [
+              'https://tobaccolifestyle.com/collections/pipe-tobacco/products/cornell-diehl-briar-fox-2oz-56-7-gram-tin',
+              'https://www.havahavana.com/products/germains-brown-flake-pipe-tobacco-50g-tin',
+              'https://pipemoment.com/en/products/salty-dogs-50g',
+          ]
+          for url in urls:
+              result = crawl_one({'url': url})
+              print(result)
+              if not result['fetch_ok']:
+                  raise SystemExit(f'UCP smoke test failed: {result}')
+          PY
