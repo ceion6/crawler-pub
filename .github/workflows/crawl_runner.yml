@@ -27,7 +27,7 @@ concurrency:
 
 jobs:
   crawl:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     timeout-minutes: 25
     steps:
       - name: Checkout
@@ -47,10 +47,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      # 验证 Chrome 环境（ubuntu-latest 预装）
+      # 验证 Chrome 环境（macos-latest 预装）
       - name: Verify Chrome environment
         run: |
-          google-chrome --version
+          /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --version
           chromedriver --version
 
       - name: Install dependencies
