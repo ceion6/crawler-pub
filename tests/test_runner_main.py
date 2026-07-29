@@ -194,6 +194,34 @@ class RunnerMainTests(unittest.TestCase):
         self.assertEqual(result['url'], task['url'])
         requires_selenium_mock.assert_not_called()
 
+    def test_crawl_one_fetches_70cigars_from_ucp_catalog(self):
+        task = {'url': 'https://70cigars.com/products/sample-blend'}
+        response = Mock(status_code=200, headers={})
+        response.json.return_value = {
+            'result': {
+                'isError': False,
+                'structuredContent': {
+                    'products': [
+                        {
+                            'handle': 'sample-blend',
+                            'variants': [
+                                {'availability': {'available': False}, 'price': {'amount': 2300}},
+                            ],
+                        },
+                    ]
+                },
+            }
+        }
+
+        with patch('runner.main.curl_requests.post', return_value=response) as curl_post_mock:
+            result = main.crawl_one(task)
+
+        self.assertEqual(curl_post_mock.call_args.args[0], main.SEVENTYCIGARS_UCP_ENDPOINT)
+        self.assertTrue(result['fetch_ok'])
+        self.assertFalse(result['in_stock'])
+        self.assertEqual(result['price'], '$23.00')
+        self.assertEqual(result['url'], task['url'])
+
     def test_decrypt_pipeuncle_payload_uses_known_aes_key(self):
         payload = json.dumps({'totalStock': 2, 'sellPrice': 20.15}).encode('utf-8')
         pad_size = AES.block_size - (len(payload) % AES.block_size)
