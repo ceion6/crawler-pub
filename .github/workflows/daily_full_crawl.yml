@@ -70,19 +70,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run full crawler
-        env:
-          MONITOR_API_BASE_URL: ${{ secrets.MONITOR_API_BASE_URL }}
-          MONITOR_API_CLIENT_ID: ${{ secrets.MONITOR_API_CLIENT_ID }}
-          MONITOR_API_SECRET: ${{ secrets.MONITOR_API_SECRET }}
-          MONITOR_TIERS: ${{ github.event.inputs.tiers || 'low,high' }}
-          MONITOR_SOURCE_MODE: catalog
-          MONITOR_RESULT_MODE: catalog
-          MONITOR_PAGE_SIZE: ${{ github.event.inputs.page_size || '100' }}
-          MONITOR_REFRESH_ON_FIRST_PULL: 'true'
-          MONITOR_SHARD_TOTAL: '3'
-          MONITOR_SHARD_INDEX: '0'
-          MAX_WORKERS: 12
-        run: python -m runner.main
+        run: python -m runner.sp_smoke
 
   crawl_shard_1:
     name: Daily Full Crawl (shard 2/3)
