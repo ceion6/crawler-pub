@@ -50,8 +50,23 @@ SEVENTYCIGARS_HOSTS = {
     '70cigars.com',
     'www.70cigars.com',
 }
+TOBACCOLIFESTYLE_HOSTS = {
+    'tobaccolifestyle.com',
+    'www.tobaccolifestyle.com',
+}
+HAVAHAVANA_HOSTS = {
+    'havahavana.com',
+    'www.havahavana.com',
+}
+PIPEMOMENT_HOSTS = {
+    'pipemoment.com',
+    'www.pipemoment.com',
+}
 FOURNOGGINS_UCP_ENDPOINT = 'https://4noggins-com.myshopify.com/api/ucp/mcp'
 SEVENTYCIGARS_UCP_ENDPOINT = 'https://70cigars.com/api/ucp/mcp'
+TOBACCOLIFESTYLE_UCP_ENDPOINT = 'https://tobaccolifestyle.com/api/ucp/mcp'
+HAVAHAVANA_UCP_ENDPOINT = 'https://www.havahavana.com/api/ucp/mcp'
+PIPEMOMENT_UCP_ENDPOINT = 'https://pipemoment.com/api/ucp/mcp'
 UCP_AGENT_PROFILE = 'https://youdou.shop/.well-known/ucp'
 PIPEUNCLE_AES_KEY = b'0f5ef28c56b64e67'
 TLS_IMPERSONATION_HOSTS = {
@@ -177,6 +192,22 @@ def _format_price(value) -> str:
     except (TypeError, ValueError):
         return str(value).strip()
     return f'${numeric:.2f}'
+
+
+def _format_ucp_price(amount, currency: str = 'USD', divisor: float = 1.0) -> str:
+    try:
+        numeric = float(amount) / 100 / divisor
+    except (TypeError, ValueError, ZeroDivisionError):
+        return ''
+
+    currency = (currency or 'USD').upper()
+    symbol = {
+        'USD': '$',
+        'GBP': '£',
+        'HKD': 'HK$',
+        'EUR': '€',
+    }.get(currency)
+    return f'{symbol}{numeric:.2f}' if symbol else f'{currency} {numeric:.2f}'
 
 
 def _normalize_host(url: str) -> str:
@@ -324,10 +355,15 @@ def _crawl_shopify_via_ucp(
     url: str,
     endpoint: str,
     reason_prefix: str,
+    price_divisor: float = 1.0,
+    search_limit: int = 10,
     gate: Optional[HostGate] = None,
 ) -> Dict:
     path_parts = [part for part in urlparse(url).path.split('/') if part]
-    if len(path_parts) < 2 or path_parts[0] != 'products':
+    try:
+        products_index = path_parts.index('products')
+        handle = path_parts[products_index + 1]
+    except (ValueError, IndexError):
         return {
             'url': url,
             'fetch_ok': False,
@@ -336,7 +372,6 @@ def _crawl_shopify_via_ucp(
             'reason': f'{reason_prefix}_handle_missing',
         }
 
-    handle = path_parts[1]
     headers = {
         'Accept': 'application/json',
         'Content-Type': 'application/json',
@@ -355,42 +390,52 @@ def _crawl_shopify_via_ucp(
                 },
                 'catalog': {
                     'query': handle.replace('-', ' '),
-                    'pagination': {'limit': 10},
+                    'pagination': {'limit': search_limit},
                 },
             },
         },
     }
     impersonate = os.getenv('MONITOR_HTTP_IMPERSONATE', 'chrome').strip() or 'chrome'
 
-    if gate is not None:
-        gate.acquire()
-    try:
-        response = curl_requests.post(
-            endpoint,
-            timeout=30,
-            headers=headers,
-            json=request_payload,
-            impersonate=impersonate,
-        )
-    except Exception as exc:
-        return {
-            'url': url,
-            'fetch_ok': False,
-            'in_stock': False,
-            'price': '',
-            'reason': f'{reason_prefix}_api_exception:{type(exc).__name__}',
-        }
-    finally:
+    response = None
+    for attempt in range(1, 3):
         if gate is not None:
-            gate.release()
+            gate.acquire()
+        try:
+            response = curl_requests.post(
+                endpoint,
+                timeout=30,
+                headers=headers,
+                json=request_payload,
+                impersonate=impersonate,
+            )
+        except Exception as exc:
+            if attempt < 2:
+                time.sleep(1.0)
+                continue
+            return {
+                'url': url,
+                'fetch_ok': False,
+                'in_stock': False,
+                'price': '',
+                'reason': f'{reason_prefix}_api_exception:{type(exc).__name__}',
+            }
+        finally:
+            if gate is not None:
+                gate.release()
 
-    if response.status_code != 200:
+        if response.status_code in TRANSIENT_STATUS_CODES and attempt < 2:
+            time.sleep(1.0)
+            continue
+        break
+
+    if response is None or response.status_code != 200:
         return {
             'url': url,
             'fetch_ok': False,
             'in_stock': False,
             'price': '',
-            'reason': f'{reason_prefix}_http_{response.status_code}',
+            'reason': f'{reason_prefix}_http_{response.status_code if response is not None else "unknown"}',
         }
 
     try:
@@ -428,6 +473,19 @@ def _crawl_shopify_via_ucp(
         None,
     )
     if product is None:
+        alias_products = [
+            item
+            for item in products
+            if isinstance(item, dict)
+            and isinstance(item.get('handle'), str)
+            and (
+                item['handle'].endswith(f'-{handle}')
+                or handle.endswith(f'-{item["handle"]}')
+            )
+        ]
+        if len(alias_products) == 1:
+            product = alias_products[0]
+    if product is None:
         return {
             'url': url,
             'fetch_ok': True,
@@ -451,10 +509,8 @@ def _crawl_shopify_via_ucp(
     )
     price_detail = price_variant.get('price')
     price_cents = price_detail.get('amount') if isinstance(price_detail, dict) else None
-    try:
-        price = _format_price(float(price_cents) / 100) if price_cents is not None else ''
-    except (TypeError, ValueError):
-        price = ''
+    currency = price_detail.get('currency', 'USD') if isinstance(price_detail, dict) else 'USD'
+    price = _format_ucp_price(price_cents, currency, price_divisor) if price_cents is not None else ''
 
     return {
         'url': url,
@@ -618,6 +674,29 @@ def crawl_one(
             url,
             SEVENTYCIGARS_UCP_ENDPOINT,
             'seventycigars',
+            gate=host_gate,
+        )
+    if host in TOBACCOLIFESTYLE_HOSTS:
+        return _crawl_shopify_via_ucp(
+            url,
+            TOBACCOLIFESTYLE_UCP_ENDPOINT,
+            'tobaccolifestyle',
+            gate=host_gate,
+        )
+    if host in HAVAHAVANA_HOSTS:
+        return _crawl_shopify_via_ucp(
+            url,
+            HAVAHAVANA_UCP_ENDPOINT,
+            'havahavana',
+            price_divisor=1.2,
+            gate=host_gate,
+        )
+    if host in PIPEMOMENT_HOSTS:
+        return _crawl_shopify_via_ucp(
+            url,
+            PIPEMOMENT_UCP_ENDPOINT,
+            'pipemoment',
+            search_limit=50,
             gate=host_gate,
         )
 

@@ -222,6 +222,135 @@ class RunnerMainTests(unittest.TestCase):
         self.assertEqual(result['price'], '$23.00')
         self.assertEqual(result['url'], task['url'])
 
+    def test_crawl_one_fetches_tobaccolifestyle_nested_product_from_ucp_catalog(self):
+        task = {
+            'url': (
+                'https://tobaccolifestyle.com/collections/pipe-tobacco/products/'
+                'cornell-diehl-briar-fox-2oz-56-7-gram-tin'
+            )
+        }
+        response = Mock(status_code=200, headers={})
+        response.json.return_value = {
+            'result': {
+                'isError': False,
+                'structuredContent': {
+                    'products': [
+                        {
+                            'handle': 'cornell-diehl-briar-fox-2oz-56-7-gram-tin',
+                            'variants': [
+                                {
+                                    'availability': {'available': False},
+                                    'price': {'amount': 8200, 'currency': 'HKD'},
+                                },
+                            ],
+                        },
+                    ]
+                },
+            }
+        }
+
+        with patch('runner.main.curl_requests.post', return_value=response) as curl_post_mock:
+            result = main.crawl_one(task)
+
+        self.assertEqual(curl_post_mock.call_args.args[0], main.TOBACCOLIFESTYLE_UCP_ENDPOINT)
+        self.assertTrue(result['fetch_ok'])
+        self.assertFalse(result['in_stock'])
+        self.assertEqual(result['price'], 'HK$82.00')
+
+    def test_crawl_one_retries_transient_ucp_connection_failure(self):
+        task = {'url': 'https://tobaccolifestyle.com/products/sample-blend'}
+        response = Mock(status_code=200, headers={})
+        response.json.return_value = {
+            'result': {
+                'isError': False,
+                'structuredContent': {
+                    'products': [
+                        {
+                            'handle': 'sample-blend',
+                            'variants': [
+                                {
+                                    'availability': {'available': True},
+                                    'price': {'amount': 8200, 'currency': 'HKD'},
+                                },
+                            ],
+                        },
+                    ]
+                },
+            }
+        }
+
+        with patch('runner.main.curl_requests.post', side_effect=[RuntimeError('temporary'), response]) as curl_post_mock:
+            with patch('runner.main.time.sleep') as sleep_mock:
+                result = main.crawl_one(task)
+
+        self.assertEqual(curl_post_mock.call_count, 2)
+        sleep_mock.assert_called_once()
+        self.assertTrue(result['fetch_ok'])
+        self.assertTrue(result['in_stock'])
+
+    def test_crawl_one_fetches_havahavana_from_ucp_catalog_and_removes_vat(self):
+        task = {'url': 'https://www.havahavana.com/products/germains-brown-flake-pipe-tobacco-50g-tin'}
+        response = Mock(status_code=200, headers={})
+        response.json.return_value = {
+            'result': {
+                'isError': False,
+                'structuredContent': {
+                    'products': [
+                        {
+                            'handle': 'germains-brown-flake-pipe-tobacco-50g-tin',
+                            'variants': [
+                                {
+                                    'availability': {'available': False},
+                                    'price': {'amount': 3000, 'currency': 'GBP'},
+                                },
+                            ],
+                        },
+                    ]
+                },
+            }
+        }
+
+        with patch('runner.main.curl_requests.post', return_value=response) as curl_post_mock:
+            result = main.crawl_one(task)
+
+        self.assertEqual(curl_post_mock.call_args.args[0], main.HAVAHAVANA_UCP_ENDPOINT)
+        self.assertTrue(result['fetch_ok'])
+        self.assertFalse(result['in_stock'])
+        self.assertEqual(result['price'], '£25.00')
+
+    def test_crawl_one_matches_pipemoment_ucp_handle_with_brand_prefix(self):
+        task = {'url': 'https://pipemoment.com/en/products/salty-dogs-50g'}
+        response = Mock(status_code=200, headers={})
+        response.json.return_value = {
+            'result': {
+                'isError': False,
+                'structuredContent': {
+                    'products': [
+                        {
+                            'handle': 'dtm-salty-dogs-50g',
+                            'variants': [
+                                {
+                                    'availability': {'available': False},
+                                    'price': {'amount': 1700, 'currency': 'USD'},
+                                },
+                            ],
+                        },
+                    ]
+                },
+            }
+        }
+
+        with patch('runner.main.curl_requests.post', return_value=response) as curl_post_mock:
+            result = main.crawl_one(task)
+
+        self.assertEqual(curl_post_mock.call_args.args[0], main.PIPEMOMENT_UCP_ENDPOINT)
+        request_payload = curl_post_mock.call_args.kwargs['json']
+        self.assertEqual(request_payload['params']['arguments']['catalog']['pagination']['limit'], 50)
+        self.assertTrue(result['fetch_ok'])
+        self.assertFalse(result['in_stock'])
+        self.assertEqual(result['price'], '$17.00')
+        self.assertEqual(result['reason'], '')
+
     def test_decrypt_pipeuncle_payload_uses_known_aes_key(self):
         payload = json.dumps({'totalStock': 2, 'sellPrice': 20.15}).encode('utf-8')
         pad_size = AES.block_size - (len(payload) % AES.block_size)
