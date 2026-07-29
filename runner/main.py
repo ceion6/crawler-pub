@@ -46,7 +46,8 @@ FOURNOGGINS_HOSTS = {
     '4noggins.com',
     'www.4noggins.com',
 }
-FOURNOGGINS_SHOPIFY_HOST = '4noggins-com.myshopify.com'
+FOURNOGGINS_UCP_ENDPOINT = 'https://4noggins-com.myshopify.com/api/ucp/mcp'
+UCP_AGENT_PROFILE = 'https://youdou.shop/.well-known/ucp'
 PIPEUNCLE_AES_KEY = b'0f5ef28c56b64e67'
 TLS_IMPERSONATION_HOSTS = {
     'smokingpipes.com',
@@ -314,22 +315,47 @@ def _crawl_pipeuncle_via_api(url: str, gate: Optional[HostGate] = None) -> Dict:
     }
 
 
-def _crawl_fournoggins_via_shopify(url: str, gate: Optional[HostGate] = None) -> Dict:
+def _crawl_fournoggins_via_ucp(url: str, gate: Optional[HostGate] = None) -> Dict:
     path_parts = [part for part in urlparse(url).path.split('/') if part]
     if len(path_parts) < 2 or path_parts[0] != 'products':
         return {'url': url, 'fetch_ok': False, 'in_stock': False, 'price': '', 'reason': 'fournoggins_handle_missing'}
 
-    api_url = f'https://{FOURNOGGINS_SHOPIFY_HOST}/products/{path_parts[1]}.js'
+    handle = path_parts[1]
     headers = {
         'Accept': 'application/json',
-        'Referer': url,
+        'Content-Type': 'application/json',
+    }
+    request_payload = {
+        'jsonrpc': '2.0',
+        'id': 1,
+        'method': 'tools/call',
+        'params': {
+            'name': 'search_catalog',
+            'arguments': {
+                'meta': {
+                    'ucp-agent': {
+                        'profile': UCP_AGENT_PROFILE,
+                    }
+                },
+                'catalog': {
+                    'query': handle.replace('-', ' '),
+                    'pagination': {'limit': 10},
+                },
+            },
+        },
     }
     impersonate = os.getenv('MONITOR_HTTP_IMPERSONATE', 'chrome').strip() or 'chrome'
 
     if gate is not None:
         gate.acquire()
     try:
-        response = curl_requests.get(api_url, timeout=20, headers=headers, impersonate=impersonate)
+        response = curl_requests.post(
+            FOURNOGGINS_UCP_ENDPOINT,
+            timeout=30,
+            headers=headers,
+            json=request_payload,
+            impersonate=impersonate,
+        )
     except Exception as exc:
         return {
             'url': url,
@@ -362,14 +388,53 @@ def _crawl_fournoggins_via_shopify(url: str, gate: Optional[HostGate] = None) ->
             'reason': f'fournoggins_json_error:{type(exc).__name__}',
         }
 
-    variants = payload.get('variants') if isinstance(payload, dict) else []
+    if not isinstance(payload, dict):
+        return {'url': url, 'fetch_ok': False, 'in_stock': False, 'price': '', 'reason': 'fournoggins_ucp_invalid'}
+
+    if payload.get('error'):
+        error_code = payload['error'].get('code', 'unknown') if isinstance(payload['error'], dict) else 'unknown'
+        return {
+            'url': url,
+            'fetch_ok': False,
+            'in_stock': False,
+            'price': '',
+            'reason': f'fournoggins_ucp_error_{error_code}',
+        }
+
+    result = payload.get('result')
+    if not isinstance(result, dict) or result.get('isError'):
+        return {'url': url, 'fetch_ok': False, 'in_stock': False, 'price': '', 'reason': 'fournoggins_ucp_invalid'}
+
+    structured_content = result.get('structuredContent')
+    products = structured_content.get('products', []) if isinstance(structured_content, dict) else []
+    product = next(
+        (item for item in products if isinstance(item, dict) and item.get('handle') == handle),
+        None,
+    )
+    if product is None:
+        return {
+            'url': url,
+            'fetch_ok': True,
+            'in_stock': False,
+            'price': '',
+            'reason': 'fournoggins_product_missing',
+        }
+
+    variants = product.get('variants') if isinstance(product, dict) else []
     variants = variants if isinstance(variants, list) else []
-    available_variants = [variant for variant in variants if isinstance(variant, dict) and variant.get('available')]
+    available_variants = [
+        variant
+        for variant in variants
+        if isinstance(variant, dict)
+        and isinstance(variant.get('availability'), dict)
+        and variant['availability'].get('available')
+    ]
     price_variant = available_variants[0] if available_variants else next(
         (variant for variant in variants if isinstance(variant, dict)),
         {},
     )
-    price_cents = price_variant.get('price')
+    price_detail = price_variant.get('price')
+    price_cents = price_detail.get('amount') if isinstance(price_detail, dict) else None
     try:
         price = _format_price(float(price_cents) / 100) if price_cents is not None else ''
     except (TypeError, ValueError):
@@ -378,7 +443,7 @@ def _crawl_fournoggins_via_shopify(url: str, gate: Optional[HostGate] = None) ->
     return {
         'url': url,
         'fetch_ok': True,
-        'in_stock': bool(available_variants or payload.get('available')),
+        'in_stock': bool(available_variants),
         'price': price,
         'reason': '',
     }
@@ -526,7 +591,7 @@ def crawl_one(
     if host in PIPEUNCLE_HOSTS:
         return _crawl_pipeuncle_via_api(url, gate=host_gate)
     if host in FOURNOGGINS_HOSTS:
-        return _crawl_fournoggins_via_shopify(url, gate=host_gate)
+        return _crawl_fournoggins_via_ucp(url, gate=host_gate)
 
     host_policy = _resolve_host_policy(host, host_policy_overrides)
     if STRATEGY_RUNTIME.requires_selenium(task):

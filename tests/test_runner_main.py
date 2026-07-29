@@ -152,24 +152,41 @@ class RunnerMainTests(unittest.TestCase):
         self.assertEqual(result['reason'], 'skipped_smokingpipes')
         create_scraper_mock.assert_not_called()
 
-    def test_crawl_one_fetches_fournoggins_from_shopify_product_feed(self):
+    def test_crawl_one_fetches_fournoggins_from_ucp_catalog(self):
         task = {'url': 'https://4noggins.com/products/sample-blend'}
         response = Mock(status_code=200, headers={})
         response.json.return_value = {
-            'available': True,
-            'variants': [
-                {'available': True, 'price': 1250},
-                {'available': False, 'price': 1400},
-            ],
+            'result': {
+                'isError': False,
+                'structuredContent': {
+                    'products': [
+                        {
+                            'handle': 'different-blend',
+                            'variants': [{'availability': {'available': True}, 'price': {'amount': 999}}],
+                        },
+                        {
+                            'handle': 'sample-blend',
+                            'variants': [
+                                {'availability': {'available': True}, 'price': {'amount': 1250}},
+                                {'availability': {'available': False}, 'price': {'amount': 1400}},
+                            ],
+                        },
+                    ]
+                },
+            }
         }
 
-        with patch('runner.main.curl_requests.get', return_value=response) as curl_get_mock:
+        with patch('runner.main.curl_requests.post', return_value=response) as curl_post_mock:
             with patch.object(main.STRATEGY_RUNTIME, 'requires_selenium') as requires_selenium_mock:
                 result = main.crawl_one(task)
 
+        self.assertEqual(curl_post_mock.call_args.args[0], main.FOURNOGGINS_UCP_ENDPOINT)
+        request_payload = curl_post_mock.call_args.kwargs['json']
+        self.assertEqual(request_payload['params']['name'], 'search_catalog')
+        self.assertEqual(request_payload['params']['arguments']['catalog']['query'], 'sample blend')
         self.assertEqual(
-            curl_get_mock.call_args.args[0],
-            'https://4noggins-com.myshopify.com/products/sample-blend.js',
+            request_payload['params']['arguments']['meta']['ucp-agent']['profile'],
+            main.UCP_AGENT_PROFILE,
         )
         self.assertTrue(result['fetch_ok'])
         self.assertTrue(result['in_stock'])
