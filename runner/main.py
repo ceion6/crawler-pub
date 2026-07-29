@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 import cloudscraper
+import requests
 from curl_cffi import requests as curl_requests
 from requests import RequestException
 from bs4 import BeautifulSoup
@@ -533,18 +534,16 @@ def _get_pipemoment_json(
     policy: Optional[HostPolicy] = None,
 ) -> Optional[Dict]:
     headers = {'Accept': 'application/json'}
-    impersonate = os.getenv('MONITOR_HTTP_IMPERSONATE', 'chrome').strip() or 'chrome'
     request_policy = policy or DEFAULT_HOST_POLICY_OVERRIDES['pipemoment.com']
     response = None
     for attempt in range(1, request_policy.max_attempts + 1):
         if gate is not None:
             gate.acquire()
         try:
-            response = curl_requests.get(
+            response = requests.get(
                 endpoint,
-                timeout=30,
+                timeout=20,
                 headers=headers,
-                impersonate=impersonate,
             )
         except Exception:
             if attempt < request_policy.max_attempts:

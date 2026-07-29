@@ -339,12 +339,12 @@ class RunnerMainTests(unittest.TestCase):
             ]
         }
 
-        with patch('runner.main.curl_requests.get', return_value=response) as curl_get_mock:
+        with patch('runner.main.requests.get', return_value=response) as requests_get_mock:
             with patch('runner.main.curl_requests.post') as curl_post_mock:
                 result = main.crawl_one(task)
 
         self.assertEqual(
-            curl_get_mock.call_args.args[0],
+            requests_get_mock.call_args.args[0],
             main.PIPEMOMENT_CATALOG_ENDPOINT,
         )
         curl_post_mock.assert_not_called()
@@ -367,18 +367,18 @@ class RunnerMainTests(unittest.TestCase):
         }
 
         with patch(
-            'runner.main.curl_requests.get',
+            'runner.main.requests.get',
             side_effect=[
                 limited_response,
                 limited_response,
                 limited_response,
                 success_response,
             ],
-        ) as curl_get_mock:
+        ) as requests_get_mock:
             with patch('runner.main.time.sleep') as sleep_mock:
                 result = main.crawl_one(task)
 
-        self.assertEqual(curl_get_mock.call_count, 4)
+        self.assertEqual(requests_get_mock.call_count, 4)
         self.assertEqual(sleep_mock.call_count, 3)
         self.assertTrue(result['fetch_ok'])
         self.assertEqual(result['price'], '$12.90')
@@ -406,7 +406,7 @@ class RunnerMainTests(unittest.TestCase):
             }
         }
 
-        with patch('runner.main.curl_requests.get', return_value=json_response):
+        with patch('runner.main.requests.get', return_value=json_response):
             with patch('runner.main.curl_requests.post', return_value=ucp_response) as curl_post_mock:
                 result = main.crawl_one(task)
 
