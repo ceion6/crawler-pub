@@ -17,6 +17,9 @@ class FakeResponse:
 
 
 class RunnerMainTests(unittest.TestCase):
+    def setUp(self):
+        main._pipemoment_catalog_cache = None
+
     def test_resolve_host_policy_uses_strict_default_for_fournoggins(self):
         policy = main._resolve_host_policy('www.4noggins.com')
         self.assertEqual(policy.max_parallel, 1)
@@ -318,20 +321,22 @@ class RunnerMainTests(unittest.TestCase):
         self.assertFalse(result['in_stock'])
         self.assertEqual(result['price'], '£25.00')
 
-    def test_crawl_one_fetches_pipemoment_from_shopify_product_json(self):
+    def test_crawl_one_fetches_pipemoment_from_shopify_catalog_json(self):
         task = {'url': 'https://pipemoment.com/en/products/gawith-hoggarth-rodeo-50g'}
         response = Mock(status_code=200, headers={})
         response.json.return_value = {
-            'handle': 'gawith-hoggarth-rodeo-50g',
-            'available': True,
-            'price': 1290,
-            'variants': [
+            'products': [
                 {
-                    'id': 54177307033899,
-                    'available': True,
-                    'price': 1290,
+                    'handle': 'gawith-hoggarth-rodeo-50g',
+                    'variants': [
+                        {
+                            'id': 54177307033899,
+                            'available': True,
+                            'price': '12.90',
+                        },
+                    ],
                 },
-            ],
+            ]
         }
 
         with patch('runner.main.curl_requests.get', return_value=response) as curl_get_mock:
@@ -340,7 +345,7 @@ class RunnerMainTests(unittest.TestCase):
 
         self.assertEqual(
             curl_get_mock.call_args.args[0],
-            'https://pipemoment.com/en/products/gawith-hoggarth-rodeo-50g.js',
+            main.PIPEMOMENT_CATALOG_ENDPOINT,
         )
         curl_post_mock.assert_not_called()
         self.assertTrue(result['fetch_ok'])
@@ -348,13 +353,17 @@ class RunnerMainTests(unittest.TestCase):
         self.assertEqual(result['price'], '$12.90')
         self.assertEqual(result['reason'], '')
 
-    def test_crawl_one_retries_pipemoment_product_json_after_rate_limit(self):
+    def test_crawl_one_retries_pipemoment_catalog_json_after_rate_limit(self):
         task = {'url': 'https://pipemoment.com/en/products/gawith-hoggarth-rodeo-50g'}
         limited_response = Mock(status_code=429, headers={})
         success_response = Mock(status_code=200, headers={})
         success_response.json.return_value = {
-            'handle': 'gawith-hoggarth-rodeo-50g',
-            'variants': [{'id': 1, 'available': True, 'price': 1290}],
+            'products': [
+                {
+                    'handle': 'gawith-hoggarth-rodeo-50g',
+                    'variants': [{'id': 1, 'available': True, 'price': '12.90'}],
+                }
+            ]
         }
 
         with patch(

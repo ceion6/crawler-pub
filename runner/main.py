@@ -67,6 +67,10 @@ SEVENTYCIGARS_UCP_ENDPOINT = 'https://70cigars.com/api/ucp/mcp'
 TOBACCOLIFESTYLE_UCP_ENDPOINT = 'https://tobaccolifestyle.com/api/ucp/mcp'
 HAVAHAVANA_UCP_ENDPOINT = 'https://www.havahavana.com/api/ucp/mcp'
 PIPEMOMENT_UCP_ENDPOINT = 'https://pipemoment.com/api/ucp/mcp'
+PIPEMOMENT_CATALOG_ENDPOINT = (
+    'https://pipemoment.com/en/collections/all-pipetobacco/'
+    'products.json?limit=250&page=1'
+)
 UCP_AGENT_PROFILE = 'https://youdou.shop/.well-known/ucp'
 PIPEUNCLE_AES_KEY = b'0f5ef28c56b64e67'
 TLS_IMPERSONATION_HOSTS = {
@@ -96,6 +100,8 @@ DEFAULT_REQUEST_HEADERS = {
     'Pragma': 'no-cache',
     'Upgrade-Insecure-Requests': '1',
 }
+_pipemoment_catalog_lock = threading.Lock()
+_pipemoment_catalog_cache: Optional[Dict[str, Dict]] = None
 
 
 @dataclass(frozen=True)
@@ -521,20 +527,11 @@ def _crawl_shopify_via_ucp(
     }
 
 
-def _crawl_pipemoment_via_product_json(
-    url: str,
+def _get_pipemoment_json(
+    endpoint: str,
     gate: Optional[HostGate] = None,
     policy: Optional[HostPolicy] = None,
 ) -> Optional[Dict]:
-    parsed = urlparse(url)
-    path_parts = [part for part in parsed.path.split('/') if part]
-    try:
-        products_index = path_parts.index('products')
-        handle = path_parts[products_index + 1]
-    except (ValueError, IndexError):
-        return None
-
-    product_url = f'{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip("/")}.js'
     headers = {'Accept': 'application/json'}
     impersonate = os.getenv('MONITOR_HTTP_IMPERSONATE', 'chrome').strip() or 'chrome'
     request_policy = policy or DEFAULT_HOST_POLICY_OVERRIDES['pipemoment.com']
@@ -544,7 +541,7 @@ def _crawl_pipemoment_via_product_json(
             gate.acquire()
         try:
             response = curl_requests.get(
-                product_url,
+                endpoint,
                 timeout=30,
                 headers=headers,
                 impersonate=impersonate,
@@ -569,17 +566,46 @@ def _crawl_pipemoment_via_product_json(
     if response is None or response.status_code != 200:
         return None
     try:
-        product = response.json()
+        payload = response.json()
     except ValueError:
         return None
-    if not isinstance(product, dict) or product.get('handle') != handle:
-        return None
+    return payload if isinstance(payload, dict) else None
 
+
+def _load_pipemoment_catalog(
+    gate: Optional[HostGate] = None,
+    policy: Optional[HostPolicy] = None,
+) -> Optional[Dict[str, Dict]]:
+    global _pipemoment_catalog_cache
+    if _pipemoment_catalog_cache is not None:
+        return _pipemoment_catalog_cache
+
+    with _pipemoment_catalog_lock:
+        if _pipemoment_catalog_cache is not None:
+            return _pipemoment_catalog_cache
+        payload = _get_pipemoment_json(
+            PIPEMOMENT_CATALOG_ENDPOINT,
+            gate=gate,
+            policy=policy,
+        )
+        products = payload.get('products') if isinstance(payload, dict) else None
+        if not isinstance(products, list):
+            return None
+        _pipemoment_catalog_cache = {
+            str(product['handle']): product
+            for product in products
+            if isinstance(product, dict) and product.get('handle')
+        }
+        return _pipemoment_catalog_cache
+
+
+def _select_pipemoment_variant(product: Dict, parsed_url) -> Optional[Dict]:
     variants = product.get('variants')
     if not isinstance(variants, list) or not variants:
         return None
+
     target_variant = None
-    target_ids = parse_qs(parsed.query).get('variant', [])
+    target_ids = parse_qs(parsed_url.query).get('variant', [])
     if target_ids:
         target_id = str(target_ids[0])
         target_variant = next(
@@ -603,12 +629,70 @@ def _crawl_pipemoment_via_product_json(
         if available_variants
         else next((variant for variant in variants if isinstance(variant, dict)), {})
     )
-    in_stock = bool(target_variant.get('available')) if target_variant else bool(available_variants)
+    return {
+        'variant': selected_variant,
+        'in_stock': (
+            bool(target_variant.get('available'))
+            if target_variant
+            else bool(available_variants)
+        ),
+    }
+
+
+def _crawl_pipemoment_via_catalog_json(
+    url: str,
+    gate: Optional[HostGate] = None,
+    policy: Optional[HostPolicy] = None,
+) -> Optional[Dict]:
+    parsed = urlparse(url)
+    path_parts = [part for part in parsed.path.split('/') if part]
+    try:
+        products_index = path_parts.index('products')
+        handle = path_parts[products_index + 1]
+    except (ValueError, IndexError):
+        return None
+
+    catalog = _load_pipemoment_catalog(gate=gate, policy=policy)
+    product = catalog.get(handle) if catalog else None
+    selected = _select_pipemoment_variant(product, parsed) if product else None
+    if selected is None:
+        return None
+    price = _format_price(selected['variant'].get('price'))
+    return {
+        'url': url,
+        'fetch_ok': True,
+        'in_stock': selected['in_stock'],
+        'price': price,
+        'reason': '',
+    }
+
+
+def _crawl_pipemoment_via_product_json(
+    url: str,
+    gate: Optional[HostGate] = None,
+    policy: Optional[HostPolicy] = None,
+) -> Optional[Dict]:
+    parsed = urlparse(url)
+    path_parts = [part for part in parsed.path.split('/') if part]
+    try:
+        products_index = path_parts.index('products')
+        handle = path_parts[products_index + 1]
+    except (ValueError, IndexError):
+        return None
+
+    product_url = f'{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip("/")}.js'
+    product = _get_pipemoment_json(product_url, gate=gate, policy=policy)
+    if not isinstance(product, dict) or product.get('handle') != handle:
+        return None
+    selected = _select_pipemoment_variant(product, parsed)
+    if selected is None:
+        return None
+    selected_variant = selected['variant']
     price = _format_ucp_price(selected_variant.get('price'), 'USD')
     return {
         'url': url,
         'fetch_ok': True,
-        'in_stock': in_stock,
+        'in_stock': selected['in_stock'],
         'price': price,
         'reason': '',
     }
@@ -786,6 +870,13 @@ def crawl_one(
         )
     if host in PIPEMOMENT_HOSTS:
         pipemoment_policy = _resolve_host_policy(host, host_policy_overrides)
+        catalog_json_result = _crawl_pipemoment_via_catalog_json(
+            url,
+            gate=host_gate,
+            policy=pipemoment_policy,
+        )
+        if catalog_json_result is not None:
+            return catalog_json_result
         product_json_result = _crawl_pipemoment_via_product_json(
             url,
             gate=host_gate,
