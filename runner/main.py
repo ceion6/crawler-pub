@@ -607,7 +607,7 @@ def _crawl_shopify_via_ucp(
     if product is None:
         return {
             'url': url,
-            'fetch_ok': True,
+            'fetch_ok': False,
             'in_stock': False,
             'price': '',
             'reason': f'{reason_prefix}_product_missing',
