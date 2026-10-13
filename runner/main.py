@@ -105,6 +105,8 @@ _pipemoment_catalog_lock = threading.Lock()
 _pipemoment_catalog_cache: Optional[Dict[str, Dict]] = None
 _shopify_catalog_lock = threading.Lock()
 _shopify_catalog_cache: Dict[str, Tuple[Optional[Dict[str, Dict]], str]] = {}
+_pipeuncle_block_lock = threading.Lock()
+_pipeuncle_blocked_reason = ''
 SHOPIFY_CATALOG_ENDPOINTS = {
     '4noggins.com': 'https://4noggins.com/collections/tobacco/products.json',
     '70cigars.com': 'https://70cigars.com/collections/pipe-tobacco/products.json',
@@ -273,6 +275,19 @@ def _decrypt_pipeuncle_payload(encrypted_text: str) -> Dict:
 
 
 def _crawl_pipeuncle_via_api(url: str, gate: Optional[HostGate] = None) -> Dict:
+    global _pipeuncle_blocked_reason
+    with _pipeuncle_block_lock:
+        if _pipeuncle_blocked_reason:
+            return {'url': url, 'fetch_ok': False, 'in_stock': False, 'price': '',
+                    'reason': _pipeuncle_blocked_reason}
+        result = _fetch_pipeuncle_via_api(url, gate=gate)
+        if result.get('reason') in ('pipeuncle_http_403', 'pipeuncle_non_json_response'):
+            _pipeuncle_blocked_reason = result['reason']
+            warn(f'PipeUncle 本次运行停止重复探测: {_pipeuncle_blocked_reason}')
+        return result
+
+
+def _fetch_pipeuncle_via_api(url: str, gate: Optional[HostGate] = None) -> Dict:
     goods_id = _extract_pipeuncle_goods_id(url)
     if not goods_id:
         return {'url': url, 'fetch_ok': False, 'in_stock': False, 'price': '', 'reason': 'pipeuncle_goods_id_missing'}
@@ -313,12 +328,14 @@ def _crawl_pipeuncle_via_api(url: str, gate: Optional[HostGate] = None) -> Dict:
     try:
         payload = response.json()
     except ValueError as exc:
+        body = str(response.text).lower()
+        is_html = '<html' in body or '<!doctype html' in body
         return {
             'url': url,
             'fetch_ok': False,
             'in_stock': False,
             'price': '',
-            'reason': f'pipeuncle_json_error:{type(exc).__name__}',
+            'reason': 'pipeuncle_non_json_response' if is_html else f'pipeuncle_json_error:{type(exc).__name__}',
         }
 
     if payload.get('code') == 314:

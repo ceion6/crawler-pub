@@ -19,6 +19,7 @@ class FakeResponse:
 class RunnerMainTests(unittest.TestCase):
     def setUp(self):
         main._pipemoment_catalog_cache = None
+        main._pipeuncle_blocked_reason = ''
         # Existing UCP tests exercise that fallback without making feed requests.
         catalog_patch = patch('runner.main._crawl_shopify_via_catalog_json', return_value=None)
         catalog_patch.start()

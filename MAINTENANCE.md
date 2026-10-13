@@ -37,6 +37,9 @@ private task data is committed to this repository.
 
 403/challenge responses require an available authorized source or normal
 interactive access. Repeated requests do not make them valid product data.
+PipeUncle 403 or HTML API responses stop further probes for the current run;
+every affected listing is still reported as a failed fetch, and a new process
+probes again. Product-missing JSON responses do not stop other products.
 404s require checking whether the listing was removed or renamed. Neither
 condition should be converted into a successful stock result.
 
