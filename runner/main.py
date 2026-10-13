@@ -1227,6 +1227,27 @@ def _process_task_page(run_id: str, tier: str, config: RunConfig, page_index: in
     }
 
 
+def _check_run_health(totals: Dict[str, int], reason_counts: Counter) -> None:
+    reported = totals['reported']
+    failed = totals['failed']
+    failure_rate = failed / reported if reported else 0.0
+    summary_path = os.getenv('GITHUB_STEP_SUMMARY', '').strip()
+    if summary_path:
+        with open(summary_path, 'a', encoding='utf-8') as summary:
+            summary.write(
+                f'## Crawl results\n\n'
+                f'Processed: {totals["total"]}; succeeded: {totals["ok"]}; '
+                f'failed: {failed}; skipped: {totals["skipped"]}.\n\n'
+                f'Failure rate (excluding skips): {failure_rate:.1%}.\n\n'
+            )
+            for reason, count in reason_counts.most_common(20):
+                summary.write(f'- `{reason}`: {count}\n')
+    if failed:
+        print(f'::warning::Crawler failed {failed}/{reported} fetches ({failure_rate:.1%}); inspect the crawl summary.')
+    if (reported and totals['ok'] == 0) or (failed >= 10 and failure_rate >= 0.2):
+        raise RuntimeError(f'crawl_failure_rate:{failed}/{reported}')
+
+
 def main() -> None:
     config = _load_run_config()
     run_id = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
@@ -1295,6 +1316,7 @@ def main() -> None:
         f'elapsed={elapsed:.1f}s'
     )
     _log_issue_summary('运行', run_id, 'all', config.source_mode, None, run_reason_counts, run_host_counts)
+    _check_run_health(totals, run_reason_counts)
 
 
 if __name__ == '__main__':
