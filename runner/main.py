@@ -73,7 +73,9 @@ PIPEMOMENT_CATALOG_ENDPOINT = (
     'products.json?limit=250&page=1'
 )
 UCP_AGENT_PROFILE = 'https://youdou.shop/.well-known/ucp'
-PIPEUNCLE_AES_KEY = b'0f5ef28c56b64e67'
+# Public response key and API base from the site's current frontend bundle.
+PIPEUNCLE_AES_KEY = b'9610371598423434'
+PIPEUNCLE_API_BASE = 'https://pipeuncle-prod-afd-end-point-a2gfecefc8drfsgq.a03.azurefd.net/app-api'
 TLS_IMPERSONATION_HOSTS = {
     'smokingpipes.com',
     'www.smokingpipes.com',
@@ -292,11 +294,14 @@ def _fetch_pipeuncle_via_api(url: str, gate: Optional[HostGate] = None) -> Dict:
     if not goods_id:
         return {'url': url, 'fetch_ok': False, 'in_stock': False, 'price': '', 'reason': 'pipeuncle_goods_id_missing'}
 
-    api_url = f'https://www.pipeuncle.com/api/goods/detail?id={goods_id}&activity=default'
+    api_url = f'{PIPEUNCLE_API_BASE}/product/spu/get-detail?id={goods_id}'
     headers = {
         'Accept': 'application/json, text/plain, */*',
         'Origin': 'https://www.pipeuncle.com',
         'Referer': url,
+        'tenant-id': '1',
+        'terminal': '40',
+        'X-Api-Encrypt': 'true',
     }
     impersonate = os.getenv('MONITOR_HTTP_IMPERSONATE', 'chrome120').strip() or 'chrome120'
 
@@ -325,29 +330,36 @@ def _fetch_pipeuncle_via_api(url: str, gate: Optional[HostGate] = None) -> Dict:
             'reason': f'pipeuncle_http_{response.status_code}',
         }
 
+    encrypted = str(getattr(response, 'headers', {}).get('X-Api-Encrypt', '')).lower() == 'true'
     try:
-        payload = response.json()
-    except ValueError as exc:
+        payload = _decrypt_pipeuncle_payload(response.text) if encrypted else response.json()
+    except Exception as exc:
         body = str(response.text).lower()
         is_html = '<html' in body or '<!doctype html' in body
+        stage = 'decrypt_failed' if encrypted else 'json_error'
         return {
             'url': url,
             'fetch_ok': False,
             'in_stock': False,
             'price': '',
-            'reason': 'pipeuncle_non_json_response' if is_html else f'pipeuncle_json_error:{type(exc).__name__}',
+            'reason': 'pipeuncle_non_json_response' if is_html else f'pipeuncle_{stage}:{type(exc).__name__}',
         }
 
-    if payload.get('code') == 314:
+    if not isinstance(payload, dict):
+        return {'url': url, 'fetch_ok': False, 'in_stock': False, 'price': '',
+                'reason': 'pipeuncle_invalid_payload'}
+
+    if payload.get('code') in (1008005000, 1008005003):
         return {
             'url': url,
             'fetch_ok': True,
             'in_stock': False,
             'price': '',
-            'reason': 'pipeuncle_product_missing',
+            'reason': ('pipeuncle_product_unlisted' if payload['code'] == 1008005003
+                       else 'pipeuncle_product_missing'),
         }
 
-    if payload.get('code') != 200:
+    if payload.get('code') != 0:
         return {
             'url': url,
             'fetch_ok': False,
@@ -356,27 +368,26 @@ def _fetch_pipeuncle_via_api(url: str, gate: Optional[HostGate] = None) -> Dict:
             'reason': f'pipeuncle_api_code_{payload.get("code", "unknown")}',
         }
 
-    try:
-        detail = _decrypt_pipeuncle_payload(payload.get('data', ''))
-    except Exception as exc:
-        return {
-            'url': url,
-            'fetch_ok': False,
-            'in_stock': False,
-            'price': '',
-            'reason': f'pipeuncle_decrypt_failed:{type(exc).__name__}',
-        }
+    detail = payload.get('data')
+    if not isinstance(detail, dict):
+        return {'url': url, 'fetch_ok': False, 'in_stock': False, 'price': '',
+                'reason': 'pipeuncle_invalid_product_data'}
 
-    try:
-        total_stock = int(detail.get('totalStock') or 0)
-    except (TypeError, ValueError):
-        total_stock = 0
+    if str(detail.get('id')) != goods_id:
+        return {'url': url, 'fetch_ok': False, 'in_stock': False, 'price': '',
+                'reason': 'pipeuncle_product_id_mismatch'}
+
+    if not isinstance(detail.get('stockStatus'), bool):
+        return {'url': url, 'fetch_ok': False, 'in_stock': False, 'price': '',
+                'reason': 'pipeuncle_stock_status_missing'}
+
+    price = detail.get('price')
 
     return {
         'url': url,
         'fetch_ok': True,
-        'in_stock': total_stock > 0,
-        'price': _format_price(detail.get('sellPrice')),
+        'in_stock': detail['stockStatus'],
+        'price': _format_price(float(price) / 100) if isinstance(price, (int, float)) else '',
         'reason': '',
     }
 

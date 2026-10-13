@@ -436,12 +436,11 @@ class RunnerMainTests(unittest.TestCase):
 
     def test_crawl_one_fetches_pipeuncle_via_api_without_selenium(self):
         task = {'url': 'https://www.pipeuncle.com/detail/goods?id=261'}
-        payload = json.dumps({'totalStock': 3, 'sellPrice': 20.15}).encode('utf-8')
+        payload = json.dumps({'code': 0, 'data': {'id': 261, 'stockStatus': True, 'stock': None, 'price': 2015}}).encode('utf-8')
         pad_size = AES.block_size - (len(payload) % AES.block_size)
         cipher_text = AES.new(main.PIPEUNCLE_AES_KEY, AES.MODE_ECB).encrypt(payload + bytes([pad_size]) * pad_size)
         encoded = base64.b64encode(cipher_text).decode('ascii')
-        response = Mock(status_code=200)
-        response.json.return_value = {'code': 200, 'data': encoded}
+        response = Mock(status_code=200, headers={'X-Api-Encrypt': 'true'}, text=encoded)
 
         with patch('runner.main.curl_requests.get', return_value=response) as curl_get_mock:
             with patch.object(main.STRATEGY_RUNTIME, 'requires_selenium') as requires_selenium_mock:
@@ -458,7 +457,7 @@ class RunnerMainTests(unittest.TestCase):
     def test_crawl_one_maps_missing_pipeuncle_product_to_out_of_stock(self):
         task = {'url': 'https://www.pipeuncle.com/detail/goods?id=2239'}
         response = Mock(status_code=200)
-        response.json.return_value = {'code': 314, 'msg': '商品不存在!'}
+        response.json.return_value = {'code': 1008005000, 'msg': '商品不存在或已下架'}
 
         with patch('runner.main.curl_requests.get', return_value=response):
             result = main.crawl_one(task)
