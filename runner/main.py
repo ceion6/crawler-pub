@@ -103,6 +103,12 @@ DEFAULT_REQUEST_HEADERS = {
 }
 _pipemoment_catalog_lock = threading.Lock()
 _pipemoment_catalog_cache: Optional[Dict[str, Dict]] = None
+_shopify_catalog_lock = threading.Lock()
+_shopify_catalog_cache: Dict[str, Tuple[Optional[Dict[str, Dict]], str]] = {}
+SHOPIFY_CATALOG_ENDPOINTS = {
+    '4noggins.com': 'https://4noggins.com/collections/tobacco/products.json',
+    '70cigars.com': 'https://70cigars.com/collections/pipe-tobacco/products.json',
+}
 
 
 @dataclass(frozen=True)
@@ -356,6 +362,95 @@ def _crawl_pipeuncle_via_api(url: str, gate: Optional[HostGate] = None) -> Dict:
         'price': _format_price(detail.get('sellPrice')),
         'reason': '',
     }
+
+
+def _load_shopify_catalog(endpoint: str, gate: Optional[HostGate], policy: HostPolicy) -> Tuple[Optional[Dict[str, Dict]], str]:
+    # Keep both successful catalogs and failures for this run. A blocked feed
+    # must not be requested again for every product or every task page.
+    with _shopify_catalog_lock:
+        if endpoint in _shopify_catalog_cache:
+            return _shopify_catalog_cache[endpoint]
+        catalog: Dict[str, Dict] = {}
+        reason = ''
+        for page in range(1, 41):
+            response = None
+            for attempt in range(1, policy.max_attempts + 1):
+                if gate is not None:
+                    gate.acquire()
+                try:
+                    response = requests.get(
+                        f'{endpoint}?limit=250&page={page}',
+                        timeout=20,
+                        headers={'Accept': 'application/json'},
+                    )
+                except RequestException as exc:
+                    reason = f'exception:{type(exc).__name__}'
+                    if attempt < policy.max_attempts:
+                        time.sleep(_compute_retry_delay(attempt, policy))
+                        continue
+                    break
+                finally:
+                    if gate is not None:
+                        gate.release()
+                if response.status_code in TRANSIENT_STATUS_CODES and attempt < policy.max_attempts:
+                    time.sleep(_compute_retry_delay(attempt, policy, response=response))
+                    continue
+                reason = '' if response.status_code == 200 else f'http_{response.status_code}'
+                break
+            if reason or response is None:
+                reason = reason or 'no_response'
+                break
+            try:
+                payload = response.json()
+            except ValueError:
+                reason = 'invalid_json'
+                break
+            products = payload.get('products') if isinstance(payload, dict) else None
+            if not isinstance(products, list) or any(
+                not isinstance(p, dict) or not p.get('handle') for p in products
+            ):
+                reason = 'invalid_products'
+                break
+            if products and all(p['handle'] in catalog for p in products):
+                reason = 'pagination_repeated'
+                break
+            catalog.update({p['handle']: p for p in products})
+            if len(products) < 250:
+                _shopify_catalog_cache[endpoint] = (catalog, '')
+                info(f'商品目录已加载 host={urlparse(endpoint).netloc} pages={page} products={len(catalog)}')
+                return catalog, ''
+        reason = reason or 'pagination_limit'
+        _shopify_catalog_cache[endpoint] = (None, reason)
+        return None, reason
+
+
+def _crawl_shopify_via_catalog_json(url: str, reason_prefix: str, gate: Optional[HostGate] = None,
+                                   policy: Optional[HostPolicy] = None) -> Optional[Dict]:
+    parsed = urlparse(url)
+    host = _normalize_host(url)
+    endpoint = SHOPIFY_CATALOG_ENDPOINTS.get(host.removeprefix('www.'))
+    if endpoint is None:
+        return None
+    parts = [part for part in parsed.path.split('/') if part]
+    try:
+        handle = parts[parts.index('products') + 1]
+    except (ValueError, IndexError):
+        return None
+    catalog, reason = _load_shopify_catalog(endpoint, gate, policy or _resolve_host_policy(host))
+    if reason:
+        return {'url': url, 'fetch_ok': False, 'in_stock': False, 'price': '',
+                'reason': f'{reason_prefix}_catalog_{reason}'}
+    product = catalog.get(handle) if catalog else None
+    if product is None:
+        # The collection may omit a listing or it may have been renamed.
+        # Preserve the existing UCP lookup instead of inventing out-of-stock.
+        return None
+    selected = _select_pipemoment_variant(product, parsed)
+    if selected is None:
+        return {'url': url, 'fetch_ok': False, 'in_stock': False, 'price': '',
+                'reason': f'{reason_prefix}_catalog_variant_missing'}
+    return {'url': url, 'fetch_ok': True, 'in_stock': selected['in_stock'],
+            'price': _format_price(selected['variant'].get('price')), 'reason': ''}
 
 
 def _crawl_shopify_via_ucp(
@@ -839,6 +934,11 @@ def crawl_one(
     if host in PIPEUNCLE_HOSTS:
         return _crawl_pipeuncle_via_api(url, gate=host_gate)
     if host in FOURNOGGINS_HOSTS:
+        catalog_result = _crawl_shopify_via_catalog_json(
+            url, 'fournoggins', gate=host_gate, policy=_resolve_host_policy(host, host_policy_overrides),
+        )
+        if catalog_result is not None:
+            return catalog_result
         return _crawl_shopify_via_ucp(
             url,
             FOURNOGGINS_UCP_ENDPOINT,
@@ -846,6 +946,11 @@ def crawl_one(
             gate=host_gate,
         )
     if host in SEVENTYCIGARS_HOSTS:
+        catalog_result = _crawl_shopify_via_catalog_json(
+            url, 'seventycigars', gate=host_gate, policy=_resolve_host_policy(host, host_policy_overrides),
+        )
+        if catalog_result is not None:
+            return catalog_result
         return _crawl_shopify_via_ucp(
             url,
             SEVENTYCIGARS_UCP_ENDPOINT,

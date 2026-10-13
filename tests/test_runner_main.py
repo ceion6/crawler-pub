@@ -19,6 +19,10 @@ class FakeResponse:
 class RunnerMainTests(unittest.TestCase):
     def setUp(self):
         main._pipemoment_catalog_cache = None
+        # Existing UCP tests exercise that fallback without making feed requests.
+        catalog_patch = patch('runner.main._crawl_shopify_via_catalog_json', return_value=None)
+        catalog_patch.start()
+        self.addCleanup(catalog_patch.stop)
 
     def test_resolve_host_policy_uses_strict_default_for_fournoggins(self):
         policy = main._resolve_host_policy('www.4noggins.com')
