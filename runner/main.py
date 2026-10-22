@@ -8,7 +8,7 @@ import random
 import threading
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from typing import Dict, List, Optional, Tuple
@@ -125,6 +125,7 @@ class RunConfig:
     refresh_on_first_pull: bool
     shard_total: int
     shard_index: int
+    host_gates: Dict[str, 'HostGate'] = field(default_factory=dict, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -157,24 +158,56 @@ DEFAULT_HOST_POLICY_OVERRIDES = {
 }
 
 
+class HostCooldown(Exception):
+    def __init__(self, status_code: int, remaining: float):
+        self.status_code = status_code
+        self.remaining = remaining
+        super().__init__(f'http_{status_code}')
+
+
 class HostGate:
     def __init__(self, policy: HostPolicy):
         self._policy = policy
         self._semaphore = threading.BoundedSemaphore(value=max(1, policy.max_parallel))
         self._interval_lock = threading.Lock()
         self._next_ready_at = 0.0
+        self._cooldown_until = 0.0
+        self._cooldown_status = 0
+
+    def check_cooldown(self) -> None:
+        with self._interval_lock:
+            remaining = self._cooldown_until - time.monotonic()
+            if remaining > 0:
+                raise HostCooldown(self._cooldown_status, remaining)
+
+    def observe_response(self, response) -> None:
+        if response.status_code not in TRANSIENT_STATUS_CODES:
+            return
+        retry_after = _retry_after_seconds(response)
+        if retry_after is None or retry_after <= self._policy.backoff_cap_seconds:
+            return
+        with self._interval_lock:
+            self._cooldown_until = max(self._cooldown_until, time.monotonic() + retry_after)
+            self._cooldown_status = response.status_code
+        self.check_cooldown()
 
     def acquire(self) -> None:
         self._semaphore.acquire()
-        delay = 0.0
-        if self._policy.min_interval_seconds > 0:
-            with self._interval_lock:
-                now = time.monotonic()
-                delay = max(0.0, self._next_ready_at - now)
-                scheduled = max(now, self._next_ready_at)
-                self._next_ready_at = scheduled + self._policy.min_interval_seconds
-        if delay > 0:
-            time.sleep(delay)
+        try:
+            self.check_cooldown()
+            delay = 0.0
+            if self._policy.min_interval_seconds > 0:
+                with self._interval_lock:
+                    now = time.monotonic()
+                    delay = max(0.0, self._next_ready_at - now)
+                    scheduled = max(now, self._next_ready_at)
+                    self._next_ready_at = scheduled + self._policy.min_interval_seconds
+            if delay > 0:
+                time.sleep(delay)
+            self.check_cooldown()
+        except Exception:
+            self._semaphore.release()
+            raise
 
     def release(self) -> None:
         self._semaphore.release()
@@ -321,6 +354,8 @@ def _fetch_pipeuncle_via_api(url: str, gate: Optional[HostGate] = None) -> Dict:
         if gate is not None:
             gate.release()
 
+    if gate is not None:
+        gate.observe_response(response)
     if response.status_code != 200:
         return {
             'url': url,
@@ -420,6 +455,8 @@ def _load_shopify_catalog(endpoint: str, gate: Optional[HostGate], policy: HostP
                 finally:
                     if gate is not None:
                         gate.release()
+                if gate is not None:
+                    gate.observe_response(response)
                 if response.status_code in TRANSIENT_STATUS_CODES and attempt < policy.max_attempts:
                     time.sleep(_compute_retry_delay(attempt, policy, response=response))
                     continue
@@ -554,6 +591,8 @@ def _crawl_shopify_via_ucp(
             if gate is not None:
                 gate.release()
 
+        if gate is not None:
+            gate.observe_response(response)
         if response.status_code in TRANSIENT_STATUS_CODES and attempt < 2:
             time.sleep(1.0)
             continue
@@ -625,7 +664,21 @@ def _crawl_shopify_via_ucp(
         }
 
     variants = product.get('variants') if isinstance(product, dict) else []
-    variants = variants if isinstance(variants, list) else []
+    if not isinstance(variants, list) or not variants or not all(isinstance(variant, dict) for variant in variants):
+        return {'url': url, 'fetch_ok': False, 'in_stock': False, 'price': '',
+                'reason': f'{reason_prefix}_ucp_variants_missing'}
+    requested_variant = (parse_qs(urlparse(url).query).get('variant') or [''])[0]
+    if requested_variant:
+        # Shopify may return a numeric ID or a GraphQL ProductVariant global ID.
+        variants = [variant for variant in variants
+                    if str(variant.get('id', '')).rsplit('/', 1)[-1] == requested_variant]
+        if len(variants) != 1:
+            return {'url': url, 'fetch_ok': False, 'in_stock': False, 'price': '',
+                    'reason': f'{reason_prefix}_ucp_variant_missing'}
+    if not all(isinstance(variant.get('availability'), dict)
+               and isinstance(variant['availability'].get('available'), bool) for variant in variants):
+        return {'url': url, 'fetch_ok': False, 'in_stock': False, 'price': '',
+                'reason': f'{reason_prefix}_ucp_availability_unknown'}
     available_variants = [
         variant
         for variant in variants
@@ -677,6 +730,8 @@ def _get_pipemoment_json(
             if gate is not None:
                 gate.release()
 
+        if gate is not None:
+            gate.observe_response(response)
         if (
             response.status_code in TRANSIENT_STATUS_CODES
             and attempt < request_policy.max_attempts
@@ -856,13 +911,16 @@ def _resolve_host_policy(host: str, host_policy_overrides: Optional[Dict[str, Ho
     return DEFAULT_HOST_POLICY
 
 
-def _build_host_gates(tasks: List[Dict], host_policy_overrides: Optional[Dict[str, HostPolicy]] = None) -> Dict[str, HostGate]:
-    gates: Dict[str, HostGate] = {}
+def _build_host_gates(tasks: List[Dict], host_policy_overrides: Optional[Dict[str, HostPolicy]] = None,
+                      existing: Optional[Dict[str, HostGate]] = None) -> Dict[str, HostGate]:
+    gates = existing if existing is not None else {}
     for task in tasks:
         host = _normalize_host(task.get('url', ''))
         if not host or host in gates:
             continue
-        gates[host] = HostGate(_resolve_host_policy(host, host_policy_overrides))
+        canonical = host.removeprefix('www.')
+        gates[host] = (gates.get(canonical) or gates.get('www.' + canonical)
+                       or HostGate(_resolve_host_policy(host, host_policy_overrides)))
     return gates
 
 
@@ -941,12 +999,31 @@ def _request_once(scraper, url: str, gate: Optional[HostGate], headers: Optional
         return _request_with_headers(scraper, url, request_headers, use_impersonation)
     gate.acquire()
     try:
-        return _request_with_headers(scraper, url, request_headers, use_impersonation)
+        response = _request_with_headers(scraper, url, request_headers, use_impersonation)
+        gate.observe_response(response)
+        return response
     finally:
         gate.release()
 
 
 def crawl_one(
+    task: Dict,
+    host_gates: Optional[Dict[str, HostGate]] = None,
+    host_policy_overrides: Optional[Dict[str, HostPolicy]] = None,
+) -> Dict:
+    host = _normalize_host(task.get('url', ''))
+    gate = host_gates.get(host) if host_gates else None
+    try:
+        if gate is not None:
+            gate.check_cooldown()
+        return _crawl_one_with_gate(task, host_gates, host_policy_overrides)
+    except HostCooldown as exc:
+        return {'url': task.get('url', ''), 'fetch_ok': False, 'in_stock': False, 'price': '',
+                'reason': f'host_cooldown:http_{exc.status_code}',
+                'retry_after_seconds': round(exc.remaining, 1)}
+
+
+def _crawl_one_with_gate(
     task: Dict,
     host_gates: Optional[Dict[str, HostGate]] = None,
     host_policy_overrides: Optional[Dict[str, HostPolicy]] = None,
@@ -1055,6 +1132,8 @@ def crawl_one(
             if strategy_result:
                 return {'url': url, **strategy_result}
             return {'url': url, 'fetch_ok': True, 'in_stock': _detect_stock(text), 'price': _extract_price(text), 'reason': ''}
+        except HostCooldown:
+            raise
         except Exception as exc:
             if attempt < host_policy.max_attempts and _should_retry_exception(exc):
                 delay = _compute_retry_delay(attempt, host_policy)
@@ -1073,10 +1152,11 @@ def crawl_one(
             }
 
 
-def crawl_all(tasks: List[Dict], max_workers: int) -> List[Dict]:
+def crawl_all(tasks: List[Dict], max_workers: int,
+              host_gates: Optional[Dict[str, HostGate]] = None) -> List[Dict]:
     results: List[Dict] = []
     host_policy_overrides = _load_host_policy_overrides()
-    host_gates = _build_host_gates(tasks, host_policy_overrides)
+    host_gates = _build_host_gates(tasks, host_policy_overrides, existing=host_gates)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(crawl_one, t, host_gates, host_policy_overrides) for t in tasks]
         for future in as_completed(futures):
@@ -1192,6 +1272,23 @@ def _summarize_issues(results: List[Dict]) -> Tuple[Counter, Counter]:
     return reason_counts, host_counts
 
 
+def _summarize_sites(results: List[Dict]) -> Dict[str, Counter]:
+    sites: Dict[str, Counter] = {}
+    for row in results:
+        host = _normalize_host(row.get('url', '')).removeprefix('www.') or 'unknown'
+        counts = sites.setdefault(host, Counter(total=0, ok=0, failed=0, skipped=0, cooldown=0))
+        counts['total'] += 1
+        if _is_skip_result(row):
+            counts['skipped'] += 1
+        elif row.get('fetch_ok'):
+            counts['ok'] += 1
+        else:
+            counts['failed'] += 1
+            if str(row.get('reason', '')).startswith('host_cooldown:'):
+                counts['cooldown'] += 1
+    return sites
+
+
 def _log_issue_summary(scope: str, run_id: str, tier: str, source_mode: str, page_index: Optional[int], reason_counts: Counter, host_counts: Counter) -> None:
     if not reason_counts:
         return
@@ -1224,9 +1321,10 @@ def _process_task_page(run_id: str, tier: str, config: RunConfig, page_index: in
             'updated': 0,
             'reason_counts': Counter(),
             'host_counts': Counter(),
+            'site_summaries': {},
         }
 
-    results = crawl_all(filtered_tasks, max_workers=config.max_workers)
+    results = crawl_all(filtered_tasks, max_workers=config.max_workers, host_gates=config.host_gates)
     summary = _summarize_results(results)
     reason_counts, host_counts = _summarize_issues(results)
     reportable_results = [row for row in results if not _is_skip_result(row)]
@@ -1252,10 +1350,12 @@ def _process_task_page(run_id: str, tier: str, config: RunConfig, page_index: in
         'updated': int(payload.get('updated', 0)),
         'reason_counts': reason_counts,
         'host_counts': host_counts,
+        'site_summaries': _summarize_sites(results),
     }
 
 
-def _check_run_health(totals: Dict[str, int], reason_counts: Counter) -> None:
+def _check_run_health(totals: Dict[str, int], reason_counts: Counter,
+                      site_summaries: Optional[Dict[str, Counter]] = None) -> None:
     reported = totals['reported']
     failed = totals['failed']
     failure_rate = failed / reported if reported else 0.0
@@ -1270,6 +1370,18 @@ def _check_run_health(totals: Dict[str, int], reason_counts: Counter) -> None:
             )
             for reason, count in reason_counts.most_common(20):
                 summary.write(f'- `{reason}`: {count}\n')
+            if site_summaries:
+                summary.write('\n| Site | Total | OK | Failed | Cooldown (not fetched) | Expected skips |\n'
+                              '|---|---:|---:|---:|---:|---:|\n')
+                for host, counts in sorted(site_summaries.items()):
+                    summary.write(f'| {host} | {counts["total"]} | {counts["ok"]} | '
+                                  f'{counts["failed"]} | {counts["cooldown"]} | {counts["skipped"]} |\n')
+    for host, counts in sorted((site_summaries or {}).items()):
+        info(f'站点健康 host={host} total={counts["total"]} ok={counts["ok"]} '
+             f'failed={counts["failed"]} cooldown={counts["cooldown"]} skipped={counts["skipped"]}')
+        if counts['failed'] and not counts['ok']:
+            print(f'::warning::No successful fetches for {host}; failed={counts["failed"]}, '
+                  f'cooldown={counts["cooldown"]}.')
     if failed:
         print(f'::warning::Crawler failed {failed}/{reported} fetches ({failure_rate:.1%}); inspect the crawl summary.')
     if (reported and totals['ok'] == 0) or (failed >= 10 and failure_rate >= 0.2):
@@ -1298,6 +1410,7 @@ def main() -> None:
     }
     run_reason_counts: Counter = Counter()
     run_host_counts: Counter = Counter()
+    run_site_summaries: Dict[str, Counter] = {}
     refresh_on_this_page = config.refresh_on_first_pull
     fetched_any_task = False
 
@@ -1326,6 +1439,8 @@ def main() -> None:
                 totals[key] += page_totals[key]
             run_reason_counts.update(page_totals['reason_counts'])
             run_host_counts.update(page_totals['host_counts'])
+            for host, counts in page_totals['site_summaries'].items():
+                run_site_summaries.setdefault(host, Counter()).update(counts)
 
             batch_size = len(tasks)
             offset += batch_size
@@ -1344,7 +1459,7 @@ def main() -> None:
         f'elapsed={elapsed:.1f}s'
     )
     _log_issue_summary('运行', run_id, 'all', config.source_mode, None, run_reason_counts, run_host_counts)
-    _check_run_health(totals, run_reason_counts)
+    _check_run_health(totals, run_reason_counts, run_site_summaries)
 
 
 if __name__ == '__main__':
