@@ -637,6 +637,9 @@ def _crawl_shopify_via_ucp(
 
     structured_content = result.get('structuredContent')
     products = structured_content.get('products', []) if isinstance(structured_content, dict) else []
+    if not isinstance(products, list):
+        return {'url': url, 'fetch_ok': False, 'in_stock': False, 'price': '',
+                'reason': f'{reason_prefix}_ucp_products_invalid'}
     product = next(
         (item for item in products if isinstance(item, dict) and item.get('handle') == handle),
         None,
@@ -777,8 +780,10 @@ def _load_pipemoment_catalog(
 
 
 def _select_pipemoment_variant(product: Dict, parsed_url) -> Optional[Dict]:
-    variants = product.get('variants')
-    if not isinstance(variants, list) or not variants:
+    variants = product.get('variants') if isinstance(product, dict) else None
+    if not isinstance(variants, list) or not variants or not all(
+        isinstance(variant, dict) for variant in variants
+    ):
         return None
 
     target_variant = None
@@ -796,20 +801,23 @@ def _select_pipemoment_variant(product: Dict, parsed_url) -> Optional[Dict]:
         if target_variant is None:
             return None
 
+    stock_variants = [target_variant] if target_variant is not None else variants
+    if not all(isinstance(variant.get('available'), bool) for variant in stock_variants):
+        return None
     available_variants = [
         variant
-        for variant in variants
-        if isinstance(variant, dict) and bool(variant.get('available'))
+        for variant in stock_variants
+        if variant['available']
     ]
     selected_variant = target_variant or (
         available_variants[0]
         if available_variants
-        else next((variant for variant in variants if isinstance(variant, dict)), {})
+        else stock_variants[0]
     )
     return {
         'variant': selected_variant,
         'in_stock': (
-            bool(target_variant.get('available'))
+            target_variant['available']
             if target_variant
             else bool(available_variants)
         ),
