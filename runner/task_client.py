@@ -1,5 +1,5 @@
 import os
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from runner.auth_client import signed_post
 
@@ -10,6 +10,8 @@ def pull_task_page(
     offset: int = 0,
     refresh: bool = False,
     source_mode: str = 'all',
+    *,
+    after_url: Optional[str] = None,
 ) -> Dict:
     base_url = os.environ['MONITOR_API_BASE_URL'].rstrip('/')
     url = f'{base_url}/internal/monitor/pull-tasks'
@@ -20,6 +22,8 @@ def pull_task_page(
         'refresh': bool(refresh),
         'source_mode': source_mode,
     }
+    if after_url is not None:
+        payload['after_url'] = after_url
     response = signed_post(url, payload, timeout=30)
     response.raise_for_status()
     try:
@@ -34,7 +38,24 @@ def pull_task_page(
         for task in tasks
     ):
         raise RuntimeError('拉取任务响应无效：任务列表格式错误')
+    if after_url is not None and 'next_after_url' in page:
+        _validate_cursor_page(tasks, limit, after_url, page['next_after_url'])
     return page
+
+
+def _validate_cursor_page(tasks: List[Dict], limit: int, after_url: str, next_after_url: object) -> None:
+    page_size = max(1, limit)
+    if len(tasks) > page_size:
+        raise RuntimeError('拉取任务响应无效：游标页超过请求数量')
+    previous_url = after_url
+    for task in tasks:
+        url = task['url']
+        if url <= previous_url:
+            raise RuntimeError('拉取任务响应无效：任务游标未前进')
+        previous_url = url
+    expected_cursor = previous_url if len(tasks) == page_size else None
+    if next_after_url != expected_cursor:
+        raise RuntimeError('拉取任务响应无效：下一页游标与页面不一致')
 
 
 def pull_tasks(

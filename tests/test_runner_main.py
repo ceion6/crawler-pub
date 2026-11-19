@@ -619,19 +619,77 @@ class RunnerMainTests(unittest.TestCase):
         self.assertEqual(first_call['offset'], 0)
         self.assertTrue(first_call['refresh'])
         self.assertEqual(first_call['source_mode'], 'subscription')
+        self.assertEqual(first_call['after_url'], '')
 
         second_call = pull_mock.call_args_list[1].kwargs
         self.assertEqual(second_call['tier'], 'low')
         self.assertEqual(second_call['offset'], 2)
         self.assertFalse(second_call['refresh'])
+        self.assertIsNone(second_call['after_url'])
 
         third_call = pull_mock.call_args_list[2].kwargs
         self.assertEqual(third_call['tier'], 'high')
         self.assertEqual(third_call['offset'], 0)
         self.assertFalse(third_call['refresh'])
+        self.assertIsNone(third_call['after_url'])
 
         self.assertTrue(any('运行结束' in call.args[0] for call in info_mock.call_args_list))
         self.assertTrue(any('reported=' in call.args[0] for call in info_mock.call_args_list))
+
+    def test_main_uses_cursor_across_shard_filtering_and_resets_for_next_tier(self):
+        config = main.RunConfig(['low', 'high'], 'catalog', 'catalog', 1, 4, True, 2, 0)
+        outside_shard = {'url': 'https://example.test/a'}
+        while main._task_belongs_to_shard(outside_shard, config.shard_total, config.shard_index):
+            outside_shard['url'] += '-next'
+        inside_shard = {'url': 'https://example.test/b'}
+        while not main._task_belongs_to_shard(inside_shard, config.shard_total, config.shard_index):
+            inside_shard['url'] += '-next'
+
+        pull_responses = [
+            {'status': 'ok', 'tasks': [outside_shard], 'next_after_url': outside_shard['url']},
+            {'status': 'ok', 'tasks': [inside_shard], 'next_after_url': inside_shard['url']},
+            {'status': 'ok', 'tasks': [], 'next_after_url': None},
+            {'status': 'ok', 'tasks': [], 'next_after_url': None},
+        ]
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict('os.environ', {'MONITOR_API_BASE_URL': 'https://example.test'}))
+            stack.enter_context(patch.object(main, '_load_run_config', return_value=config))
+            stack.enter_context(patch.object(main.STRATEGY_RUNTIME, 'load'))
+            post_mock = stack.enter_context(patch('runner.task_client.signed_post'))
+            post_mock.return_value.json.side_effect = pull_responses
+            crawl_mock = stack.enter_context(patch.object(main, 'crawl_all'))
+            crawl_mock.return_value = [{'url': inside_shard['url'], 'fetch_ok': True, 'in_stock': False}]
+            report_mock = stack.enter_context(patch.object(main, 'report_results', return_value={'updated': 1}))
+            main.main()
+
+        requests = [call.args[1] for call in post_mock.call_args_list]
+        self.assertEqual([row['after_url'] for row in requests], [
+            '', outside_shard['url'], inside_shard['url'], '',
+        ])
+        self.assertEqual([row['offset'] for row in requests], [0, 0, 0, 0])
+        self.assertEqual([row['refresh'] for row in requests], [True, False, False, False])
+        self.assertEqual([row['tier'] for row in requests], ['low', 'low', 'low', 'high'])
+        self.assertTrue(all(row['source_mode'] == 'catalog' for row in requests))
+        self.assertEqual(crawl_mock.call_args.args[0], [inside_shard])
+        self.assertEqual(report_mock.call_count, 1)
+
+    def test_main_fails_if_cursor_field_disappears_before_next_tier(self):
+        config = main.RunConfig(['low', 'high'], 'subscription', 'subscription', 1, 4, True, 1, 0)
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict('os.environ', {'MONITOR_API_BASE_URL': 'https://example.test'}))
+            stack.enter_context(patch.object(main, '_load_run_config', return_value=config))
+            stack.enter_context(patch.object(main.STRATEGY_RUNTIME, 'load'))
+            post_mock = stack.enter_context(patch('runner.task_client.signed_post'))
+            post_mock.return_value.json.side_effect = [
+                {'status': 'ok', 'tasks': [], 'next_after_url': None},
+                {'status': 'ok', 'tasks': [{'url': 'https://example.test/a'}]},
+            ]
+            crawl_mock = stack.enter_context(patch.object(main, 'crawl_all'))
+            with self.assertRaisesRegex(RuntimeError, '服务端丢失任务游标'):
+                main.main()
+
+        crawl_mock.assert_not_called()
+        self.assertEqual(post_mock.call_count, 2)
 
     def test_load_run_config_defaults_catalog_result_mode_for_catalog_source(self):
         with patch.dict(

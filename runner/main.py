@@ -1008,7 +1008,12 @@ def crawl_one(
     host_gates: Optional[Dict[str, HostGate]] = None,
     host_policy_overrides: Optional[Dict[str, HostPolicy]] = None,
 ) -> Dict:
-    host = _normalize_host(task.get('url', ''))
+    url = task.get('url', '').strip()
+    hostname = (urlparse(url).hostname or '').rstrip('.')
+    if hostname == 'dreamingpipes.com' or hostname.endswith('.dreamingpipes.com'):
+        return _build_skip_result(url, 'source_permission_paused')
+
+    host = _normalize_host(url)
     gate = host_gates.get(host) if host_gates else None
     try:
         if gate is not None:
@@ -1414,19 +1419,29 @@ def main() -> None:
     run_site_summaries: Dict[str, Counter] = {}
     refresh_on_this_page = config.refresh_on_first_pull
     fetched_any_task = False
+    cursor_mode = None
 
     for tier in config.tiers:
         offset = 0
         page_index = 0
+        after_url = ''
         while True:
             payload = pull_task_page(
                 tier=tier,
                 limit=config.page_size,
-                offset=offset,
+                offset=offset if cursor_mode is False else 0,
                 refresh=refresh_on_this_page,
                 source_mode=config.source_mode,
+                after_url=after_url if cursor_mode is not False else None,
             )
             refresh_on_this_page = False
+            if cursor_mode is None:
+                # Negotiate once per run. Switching mid-run could skip tasks.
+                cursor_mode = 'next_after_url' in payload
+            if cursor_mode:
+                if 'next_after_url' not in payload:
+                    raise RuntimeError('拉取任务响应无效：服务端丢失任务游标')
+                after_url = payload['next_after_url']
             tasks = payload['tasks']
 
             if not tasks:
@@ -1446,7 +1461,7 @@ def main() -> None:
             batch_size = len(tasks)
             offset += batch_size
             page_index += 1
-            if batch_size < config.page_size:
+            if (cursor_mode and after_url is None) or (not cursor_mode and batch_size < config.page_size):
                 break
 
     empty_run_message = ''

@@ -31,6 +31,9 @@ The summary shows newly recorded server observations separately from fetch
 results. A replay can record zero new observations. Empty task pools and
 shards still get a summary. An empty catalog pool raises a warning. An
 invalid task response or report acknowledgement fails the run.
+Task pulls use URL cursors when the first response includes a cursor field.
+The whole run uses offsets if the first response comes from an older server.
+An established cursor must keep advancing until the final page.
 
 4N and 70 use their public tobacco collection feeds. All pages are loaded once
 and reused across threads and task pages. Requested variant IDs determine stock
@@ -41,6 +44,10 @@ private task data is committed to this repository.
 
 403/challenge responses require an available authorized source or normal
 interactive access. Repeated requests do not make them valid product data.
+Dreaming Pipes and its subdomains are skipped under section 12 of its
+[Terms and Conditions](https://dreamingpipes.com/terms-and-conditions/).
+The runner counts these skips as `source_permission_paused` and keeps the
+previous observations on the server.
 PipeUncle 403 or HTML API responses stop further probes for the current run;
 every affected listing is still reported as a failed fetch, and a new process
 probes again. Product-missing JSON responses do not stop other products.
