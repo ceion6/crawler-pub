@@ -47,6 +47,9 @@ or blocked catalogs stay failed for the current run rather than causing one
 request per product; the next scheduled process tries again. No catalog or
 private task data is committed to this repository.
 
+Successful HTTP observations carry `observed_at` from response receipt.
+Cached products keep the timestamp of their source page.
+
 403/challenge responses require an available authorized source or normal
 interactive access. Repeated requests do not make them valid product data.
 Dreaming Pipes and its subdomains are skipped under section 12 of its

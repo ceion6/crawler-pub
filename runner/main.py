@@ -9,7 +9,7 @@ import threading
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
@@ -25,6 +25,12 @@ from runner.report_client import report_results
 from runner.safe_logger import error, info, warn
 from runner.strategy_runtime import StrategyRuntime, generic_stock_result
 from runner.task_client import pull_task_page
+
+
+@dataclass(frozen=True)
+class JsonObservation:
+    payload: Dict
+    observed_at: str
 
 
 PRICE_PATTERN = re.compile(r'([$€£]\s?\d+(?:[.,]\d{2})?)')
@@ -102,9 +108,9 @@ DEFAULT_REQUEST_HEADERS = {
     'Upgrade-Insecure-Requests': '1',
 }
 _pipemoment_catalog_lock = threading.Lock()
-_pipemoment_catalog_cache: Optional[Dict[str, Dict]] = None
+_pipemoment_catalog_cache: Optional[JsonObservation] = None
 _shopify_catalog_lock = threading.Lock()
-_shopify_catalog_cache: Dict[str, Tuple[Optional[Dict[str, Dict]], str]] = {}
+_shopify_catalog_cache: Dict[str, Tuple[Optional[Dict[str, JsonObservation]], str]] = {}
 _pipeuncle_block_lock = threading.Lock()
 _pipeuncle_blocked_reason = ''
 SHOPIFY_CATALOG_ENDPOINTS = {
@@ -209,6 +215,10 @@ class HostGate:
 
     def release(self) -> None:
         self._semaphore.release()
+
+
+def _utc_observation_time() -> str:
+    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
 def _extract_price(text: str) -> str:
@@ -354,6 +364,7 @@ def _fetch_pipeuncle_via_api(url: str, gate: Optional[HostGate] = None) -> Dict:
             'reason': f'pipeuncle_http_{response.status_code}',
         }
 
+    observed_at = _utc_observation_time()
     encrypted = str(getattr(response, 'headers', {}).get('X-Api-Encrypt', '')).lower() == 'true'
     try:
         payload = _decrypt_pipeuncle_payload(response.text) if encrypted else response.json()
@@ -381,6 +392,7 @@ def _fetch_pipeuncle_via_api(url: str, gate: Optional[HostGate] = None) -> Dict:
             'price': '',
             'reason': ('pipeuncle_product_unlisted' if payload['code'] == 1008005003
                        else 'pipeuncle_product_missing'),
+            'observed_at': observed_at,
         }
 
     if payload.get('code') != 0:
@@ -413,16 +425,19 @@ def _fetch_pipeuncle_via_api(url: str, gate: Optional[HostGate] = None) -> Dict:
         'in_stock': detail['stockStatus'],
         'price': _format_price(float(price) / 100) if isinstance(price, (int, float)) else '',
         'reason': '',
+        'observed_at': observed_at,
     }
 
 
-def _load_shopify_catalog(endpoint: str, gate: Optional[HostGate], policy: HostPolicy) -> Tuple[Optional[Dict[str, Dict]], str]:
+def _load_shopify_catalog(
+    endpoint: str, gate: Optional[HostGate], policy: HostPolicy
+) -> Tuple[Optional[Dict[str, JsonObservation]], str]:
     # Keep both successful catalogs and failures for this run. A blocked feed
     # must not be requested again for every product or every task page.
     with _shopify_catalog_lock:
         if endpoint in _shopify_catalog_cache:
             return _shopify_catalog_cache[endpoint]
-        catalog: Dict[str, Dict] = {}
+        catalog: Dict[str, JsonObservation] = {}
         reason = ''
         for page in range(1, 41):
             response = None
@@ -454,6 +469,7 @@ def _load_shopify_catalog(endpoint: str, gate: Optional[HostGate], policy: HostP
             if reason or response is None:
                 reason = reason or 'no_response'
                 break
+            observed_at = _utc_observation_time()
             try:
                 payload = response.json()
             except ValueError:
@@ -468,7 +484,7 @@ def _load_shopify_catalog(endpoint: str, gate: Optional[HostGate], policy: HostP
             if products and all(p['handle'] in catalog for p in products):
                 reason = 'pagination_repeated'
                 break
-            catalog.update({p['handle']: p for p in products})
+            catalog.update({p['handle']: JsonObservation(p, observed_at) for p in products})
             if len(products) < 250:
                 _shopify_catalog_cache[endpoint] = (catalog, '')
                 info(f'商品目录已加载 host={urlparse(endpoint).netloc} pages={page} products={len(catalog)}')
@@ -499,12 +515,13 @@ def _crawl_shopify_via_catalog_json(url: str, reason_prefix: str, gate: Optional
         # The collection may omit a listing or it may have been renamed.
         # Preserve the existing UCP lookup instead of inventing out-of-stock.
         return None
-    selected = _select_pipemoment_variant(product, parsed)
+    selected = _select_pipemoment_variant(product.payload, parsed)
     if selected is None:
         return {'url': url, 'fetch_ok': False, 'in_stock': False, 'price': '',
                 'reason': f'{reason_prefix}_catalog_variant_missing'}
     return {'url': url, 'fetch_ok': True, 'in_stock': selected['in_stock'],
-            'price': _format_price(selected['variant'].get('price')), 'reason': ''}
+            'price': _format_price(selected['variant'].get('price')), 'reason': '',
+            'observed_at': product.observed_at}
 
 
 def _crawl_shopify_via_ucp(
@@ -596,6 +613,7 @@ def _crawl_shopify_via_ucp(
             'reason': f'{reason_prefix}_http_{response.status_code if response is not None else "unknown"}',
         }
 
+    observed_at = _utc_observation_time()
     try:
         payload = response.json()
     except ValueError as exc:
@@ -693,6 +711,7 @@ def _crawl_shopify_via_ucp(
         'in_stock': bool(available_variants),
         'price': price,
         'reason': '',
+        'observed_at': observed_at,
     }
 
 
@@ -700,7 +719,7 @@ def _get_pipemoment_json(
     endpoint: str,
     gate: Optional[HostGate] = None,
     policy: Optional[HostPolicy] = None,
-) -> Optional[Dict]:
+) -> Optional[JsonObservation]:
     headers = {'Accept': 'application/json'}
     request_policy = policy or DEFAULT_HOST_POLICY_OVERRIDES['pipemoment.com']
     response = None
@@ -734,17 +753,18 @@ def _get_pipemoment_json(
 
     if response is None or response.status_code != 200:
         return None
+    observed_at = _utc_observation_time()
     try:
         payload = response.json()
     except ValueError:
         return None
-    return payload if isinstance(payload, dict) else None
+    return JsonObservation(payload, observed_at) if isinstance(payload, dict) else None
 
 
 def _load_pipemoment_catalog(
     gate: Optional[HostGate] = None,
     policy: Optional[HostPolicy] = None,
-) -> Optional[Dict[str, Dict]]:
+) -> Optional[JsonObservation]:
     global _pipemoment_catalog_cache
     if _pipemoment_catalog_cache is not None:
         return _pipemoment_catalog_cache
@@ -752,19 +772,22 @@ def _load_pipemoment_catalog(
     with _pipemoment_catalog_lock:
         if _pipemoment_catalog_cache is not None:
             return _pipemoment_catalog_cache
-        payload = _get_pipemoment_json(
+        response = _get_pipemoment_json(
             PIPEMOMENT_CATALOG_ENDPOINT,
             gate=gate,
             policy=policy,
         )
-        products = payload.get('products') if isinstance(payload, dict) else None
+        if response is None:
+            return None
+        products = response.payload.get('products')
         if not isinstance(products, list):
             return None
-        _pipemoment_catalog_cache = {
+        catalog = {
             str(product['handle']): product
             for product in products
             if isinstance(product, dict) and product.get('handle')
         }
+        _pipemoment_catalog_cache = JsonObservation(catalog, response.observed_at)
         return _pipemoment_catalog_cache
 
 
@@ -827,7 +850,9 @@ def _crawl_pipemoment_via_catalog_json(
         return None
 
     catalog = _load_pipemoment_catalog(gate=gate, policy=policy)
-    product = catalog.get(handle) if catalog else None
+    if catalog is None:
+        return None
+    product = catalog.payload.get(handle)
     selected = _select_pipemoment_variant(product, parsed) if product else None
     if selected is None:
         return None
@@ -838,6 +863,7 @@ def _crawl_pipemoment_via_catalog_json(
         'in_stock': selected['in_stock'],
         'price': price,
         'reason': '',
+        'observed_at': catalog.observed_at,
     }
 
 
@@ -855,10 +881,10 @@ def _crawl_pipemoment_via_product_json(
         return None
 
     product_url = f'{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip("/")}.js'
-    product = _get_pipemoment_json(product_url, gate=gate, policy=policy)
-    if not isinstance(product, dict) or product.get('handle') != handle:
+    response = _get_pipemoment_json(product_url, gate=gate, policy=policy)
+    if response is None or response.payload.get('handle') != handle:
         return None
-    selected = _select_pipemoment_variant(product, parsed)
+    selected = _select_pipemoment_variant(response.payload, parsed)
     if selected is None:
         return None
     selected_variant = selected['variant']
@@ -869,6 +895,7 @@ def _crawl_pipemoment_via_product_json(
         'in_stock': selected['in_stock'],
         'price': price,
         'reason': '',
+        'observed_at': response.observed_at,
     }
 
 
@@ -1128,12 +1155,15 @@ def _crawl_one_with_gate(
                     'price': '',
                     'reason': f'http_{response.status_code}',
                 }
+            observed_at = _utc_observation_time()
             soup = BeautifulSoup(response.text, 'lxml')
             text = soup.get_text(' ', strip=True)
-            strategy_result = STRATEGY_RUNTIME.evaluate(task, response.text)
-            if strategy_result:
-                return {'url': url, **strategy_result}
-            return {'url': url, **generic_stock_result(text), 'price': _extract_price(text)}
+            result = STRATEGY_RUNTIME.evaluate(task, response.text)
+            if not result:
+                result = {**generic_stock_result(text), 'price': _extract_price(text)}
+            if result.get('fetch_ok'):
+                return {'url': url, **result, 'observed_at': observed_at}
+            return {'url': url, **result}
         except HostCooldown:
             raise
         except Exception as exc:

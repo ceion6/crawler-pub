@@ -59,6 +59,26 @@ def test_explicit_pipemoment_stock_remains_trusted(source, price, expected_price
     assert result['price'] == expected_price
 
 
+def test_pipemoment_catalog_reuse_and_direct_product_keep_their_response_times():
+    catalog_time = '2026-10-22T07:40:00Z'
+    detail_time = '2026-10-22T08:05:00Z'
+    catalog_product = {'handle': 'sample', 'variants': [{'id': 1, 'available': True, 'price': '12.50'}]}
+    detail_product = {'handle': 'other', 'variants': [{'id': 2, 'available': False, 'price': 1750}]}
+    main._pipemoment_catalog_cache = None
+
+    with patch('runner.main.requests.get', side_effect=[
+        json_response({'products': [catalog_product]}), json_response(detail_product),
+    ]) as get, patch('runner.main._utc_observation_time', side_effect=[catalog_time, detail_time]) as clock:
+        first = main.crawl_one({'url': URL})
+        detail = main.crawl_one({'url': 'https://pipemoment.com/en/products/other'})
+        reused = main.crawl_one({'url': URL + '?variant=1'})
+
+    assert get.call_count == clock.call_count == 2
+    assert [item['observed_at'] for item in [first, detail, reused]] == [catalog_time, detail_time, catalog_time]
+    assert [item['price'] for item in [first, detail, reused]] == ['$12.50', '$17.50', '$12.50']
+    assert [item['in_stock'] for item in [first, detail, reused]] == [True, False, True]
+
+
 def test_pipemoment_requested_variant_does_not_use_another_variants_availability():
     result = crawl_product([
         {'id': 1, 'available': True, 'price': '12.50'},
@@ -98,3 +118,4 @@ def test_malformed_pipemoment_fallback_products_return_failure(products):
     assert result['fetch_ok'] is False
     assert result['price'] == ''
     assert result['reason'] == 'pipemoment_ucp_products_invalid'
+    assert 'observed_at' not in result

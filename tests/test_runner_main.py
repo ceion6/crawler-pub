@@ -66,6 +66,7 @@ class RunnerMainTests(unittest.TestCase):
 
     def test_generic_stock_requires_unambiguous_inventory_evidence(self):
         task = {'url': 'https://example.test/products/sample'}
+        observation_time = '2026-10-22T07:40:00Z'
         cases = (
             ('In stock', True, True, ''),
             ('Sold out', True, False, ''),
@@ -79,6 +80,7 @@ class RunnerMainTests(unittest.TestCase):
                 response = FakeResponse(200, f'<html><body>{text} $12.50</body></html>')
                 with patch('runner.main._build_http_client'), \
                         patch('runner.main._request_once', return_value=response), \
+                        patch('runner.main._utc_observation_time', return_value=observation_time), \
                         patch.object(main.STRATEGY_RUNTIME, 'evaluate', return_value={}):
                     result = main.crawl_one(task)
 
@@ -86,6 +88,25 @@ class RunnerMainTests(unittest.TestCase):
                 self.assertEqual(result['in_stock'], in_stock)
                 self.assertEqual(result['reason'], reason)
                 self.assertEqual(result['price'], '$12.50')
+                self.assertEqual(result.get('observed_at'), observation_time if fetch_ok else None)
+
+    def test_http_strategy_observation_is_timed_before_parse(self):
+        task = {'url': 'https://example.test/products/sample'}
+        response = FakeResponse(200, '<html><body>Fixture</body></html>')
+        observation_time = '2026-10-22T07:40:00Z'
+
+        with patch('runner.main._build_http_client'), \
+                patch('runner.main._request_once', return_value=response), \
+                patch('runner.main._utc_observation_time', return_value=observation_time) as clock:
+            def parse(task, html):
+                clock.assert_called_once()
+                return {'fetch_ok': True, 'in_stock': True, 'price': '$9.99', 'reason': ''}
+
+            with patch.object(main.STRATEGY_RUNTIME, 'evaluate', side_effect=parse):
+                result = main.crawl_one(task)
+
+        self.assertEqual(result['observed_at'], observation_time)
+        self.assertEqual(result['price'], '$9.99')
 
     def test_crawl_one_keeps_failure_shape_after_retry_exhausted(self):
         task = {'url': 'https://example.test/products/sample'}
@@ -227,6 +248,7 @@ class RunnerMainTests(unittest.TestCase):
 
     def test_crawl_one_fetches_70cigars_from_ucp_catalog(self):
         task = {'url': 'https://70cigars.com/products/sample-blend'}
+        observation_time = '2026-10-22T07:40:00Z'
         response = Mock(status_code=200, headers={})
         response.json.return_value = {
             'result': {
@@ -244,7 +266,8 @@ class RunnerMainTests(unittest.TestCase):
             }
         }
 
-        with patch('runner.main.curl_requests.post', return_value=response) as curl_post_mock:
+        with patch('runner.main.curl_requests.post', return_value=response) as curl_post_mock, \
+                patch('runner.main._utc_observation_time', return_value=observation_time):
             result = main.crawl_one(task)
 
         self.assertEqual(curl_post_mock.call_args.args[0], main.SEVENTYCIGARS_UCP_ENDPOINT)
@@ -252,6 +275,7 @@ class RunnerMainTests(unittest.TestCase):
         self.assertFalse(result['in_stock'])
         self.assertEqual(result['price'], '$23.00')
         self.assertEqual(result['url'], task['url'])
+        self.assertEqual(result['observed_at'], observation_time)
 
     def test_crawl_one_fetches_tobaccolifestyle_nested_product_from_ucp_catalog(self):
         task = {
@@ -479,15 +503,18 @@ class RunnerMainTests(unittest.TestCase):
 
     def test_crawl_one_maps_missing_pipeuncle_product_to_out_of_stock(self):
         task = {'url': 'https://www.pipeuncle.com/detail/goods?id=2239'}
+        observation_time = '2026-10-22T07:40:00Z'
         response = Mock(status_code=200)
         response.json.return_value = {'code': 1008005000, 'msg': '商品不存在或已下架'}
 
-        with patch('runner.main.curl_requests.get', return_value=response):
+        with patch('runner.main.curl_requests.get', return_value=response), \
+                patch('runner.main._utc_observation_time', return_value=observation_time):
             result = main.crawl_one(task)
 
         self.assertTrue(result['fetch_ok'])
         self.assertFalse(result['in_stock'])
         self.assertEqual(result['reason'], 'pipeuncle_product_missing')
+        self.assertEqual(result['observed_at'], observation_time)
 
     def test_process_task_page_reports_only_reportable_results_and_logs_issues(self):
         results = [

@@ -26,19 +26,24 @@ class ShopifyCatalogTests(unittest.TestCase):
         second_page = [product('last-blend', available=False, price='20.00')]
         urls = ['https://4noggins.com/products/blend-1',
                 'https://4noggins.com/products/last-blend']
-        with patch('runner.main.requests.get', side_effect=[response(first_page), response(second_page)]) as get:
+        page_times = ['2026-10-22T07:40:00Z', '2026-10-22T07:40:10Z']
+        with patch('runner.main.requests.get', side_effect=[response(first_page), response(second_page)]) as get, \
+                patch('runner.main._utc_observation_time', side_effect=page_times) as clock:
             with patch('runner.main.curl_requests.post') as post:
                 with ThreadPoolExecutor(max_workers=2) as pool:
                     results = list(pool.map(lambda url: main.crawl_one({'url': url}), urls))
                 # A later task page must reuse the same run's catalog.
-                main.crawl_one({'url': urls[0]})
+                reused = main.crawl_one({'url': urls[0]})
         self.assertEqual(get.call_count, 2)
+        self.assertEqual(clock.call_count, 2)
         post.assert_not_called()
         self.assertTrue(all(r['fetch_ok'] for r in results))
         self.assertTrue(results[0]['in_stock'])
         self.assertFalse(results[1]['in_stock'])
         self.assertEqual(results[1]['price'], '$20.00')
         self.assertIn('page=2', get.call_args_list[1].args[0])
+        self.assertEqual([result['observed_at'] for result in results], page_times)
+        self.assertEqual(reused['observed_at'], page_times[0])
 
     def test_requested_variant_stock_is_used(self):
         item = product('sample', variant_id=1, available=True)
@@ -68,6 +73,7 @@ class ShopifyCatalogTests(unittest.TestCase):
         for result in [first, second]:
             self.assertFalse(result['fetch_ok'])
             self.assertEqual(result['reason'], 'fournoggins_catalog_http_429')
+            self.assertNotIn('observed_at', result)
 
     def test_partial_catalog_failure_does_not_claim_missing_products(self):
         first_page = [product(f'blend-{i}') for i in range(250)]
