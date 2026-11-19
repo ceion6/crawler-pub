@@ -9,6 +9,11 @@ gh api repos/ceion6/crawler-pub/actions/workflows --jq '.workflows[] | {name,sta
 gh run list -R ceion6/crawler-pub --limit 10
 ```
 
+To isolate workflow-to-server connectivity, run
+`gh workflow run verify_monitor.yml -R ceion6/crawler-pub`. It reads at most
+two signed subscription pages per tier, with refresh disabled. It does not
+fetch any source or submit observations, and only logs sample counts.
+
 When the state is `disabled_inactivity`, restore the existing schedules:
 
 ```sh
