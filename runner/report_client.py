@@ -17,4 +17,13 @@ def report_results(run_id: str, results: List[Dict], result_mode: str = 'subscri
         timeout=30,
     )
     response.raise_for_status()
-    return response.json()
+    try:
+        acknowledgement = response.json()
+    except ValueError:
+        raise RuntimeError('结果回报响应无效：不是有效 JSON') from None
+    if not isinstance(acknowledgement, dict) or acknowledgement.get('status') != 'ok':
+        raise RuntimeError('结果回报响应无效：缺少成功确认')
+    updated = acknowledgement.get('updated')
+    if type(updated) is not int or not 0 <= updated <= len(results):
+        raise RuntimeError('结果回报响应无效：服务器入库数量错误')
+    return acknowledgement

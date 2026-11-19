@@ -22,7 +22,19 @@ def pull_task_page(
     }
     response = signed_post(url, payload, timeout=30)
     response.raise_for_status()
-    return response.json()
+    try:
+        page = response.json()
+    except ValueError:
+        raise RuntimeError('拉取任务响应无效：不是有效 JSON') from None
+    if not isinstance(page, dict) or page.get('status') != 'ok':
+        raise RuntimeError('拉取任务响应无效：缺少成功确认')
+    tasks = page.get('tasks')
+    if not isinstance(tasks, list) or any(
+        not isinstance(task, dict) or not isinstance(task.get('url'), str) or not task['url'].strip()
+        for task in tasks
+    ):
+        raise RuntimeError('拉取任务响应无效：任务列表格式错误')
+    return page
 
 
 def pull_tasks(
@@ -39,4 +51,4 @@ def pull_tasks(
         refresh=refresh,
         source_mode=source_mode,
     )
-    return payload.get('tasks', [])
+    return payload['tasks']

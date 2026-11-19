@@ -23,12 +23,10 @@ from Crypto.Cipher import AES
 
 from runner.report_client import report_results
 from runner.safe_logger import error, info, warn
-from runner.strategy_runtime import StrategyRuntime
+from runner.strategy_runtime import StrategyRuntime, generic_stock_result
 from runner.task_client import pull_task_page
 
 
-IN_STOCK_TOKENS = ('in stock', 'available', 'add to cart', 'buy now')
-OUT_OF_STOCK_TOKENS = ('out of stock', 'sold out', 'unavailable')
 PRICE_PATTERN = re.compile(r'([$€£]\s?\d+(?:[.,]\d{2})?)')
 TRANSIENT_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 STRATEGY_RUNTIME = StrategyRuntime()
@@ -211,15 +209,6 @@ class HostGate:
 
     def release(self) -> None:
         self._semaphore.release()
-
-
-def _detect_stock(text: str) -> bool:
-    lower = text.lower()
-    if any(token in lower for token in OUT_OF_STOCK_TOKENS):
-        return False
-    if any(token in lower for token in IN_STOCK_TOKENS):
-        return True
-    return False
 
 
 def _extract_price(text: str) -> str:
@@ -1139,7 +1128,7 @@ def _crawl_one_with_gate(
             strategy_result = STRATEGY_RUNTIME.evaluate(task, response.text)
             if strategy_result:
                 return {'url': url, **strategy_result}
-            return {'url': url, 'fetch_ok': True, 'in_stock': _detect_stock(text), 'price': _extract_price(text), 'reason': ''}
+            return {'url': url, **generic_stock_result(text), 'price': _extract_price(text)}
         except HostCooldown:
             raise
         except Exception as exc:
@@ -1344,7 +1333,7 @@ def _process_task_page(run_id: str, tier: str, config: RunConfig, page_index: in
         f'page={page_index} shard={config.shard_index + 1}/{config.shard_total} '
         f'total={summary["total"]} reported={summary["reported"]} '
         f'ok={summary["ok"]} failed={summary["failed"]} skipped={summary["skipped"]} '
-        f'in_stock={summary["in_stock"]} updated={payload.get("updated", 0)} '
+        f'in_stock={summary["in_stock"]} updated={payload["updated"]} '
         f'push_enabled={payload.get("push_enabled", False)}'
     )
     _log_issue_summary('页', run_id, tier, config.source_mode, page_index, reason_counts, host_counts)
@@ -1355,7 +1344,7 @@ def _process_task_page(run_id: str, tier: str, config: RunConfig, page_index: in
         'failed': summary['failed'],
         'skipped': summary['skipped'],
         'in_stock': summary['in_stock'],
-        'updated': int(payload.get('updated', 0)),
+        'updated': payload['updated'],
         'reason_counts': reason_counts,
         'host_counts': host_counts,
         'site_summaries': _summarize_sites(results),
@@ -1363,7 +1352,8 @@ def _process_task_page(run_id: str, tier: str, config: RunConfig, page_index: in
 
 
 def _check_run_health(totals: Dict[str, int], reason_counts: Counter,
-                      site_summaries: Optional[Dict[str, Counter]] = None) -> None:
+                      site_summaries: Optional[Dict[str, Counter]] = None, *,
+                      empty_run_message: str = '') -> None:
     reported = totals['reported']
     failed = totals['failed']
     failure_rate = failed / reported if reported else 0.0
@@ -1374,8 +1364,11 @@ def _check_run_health(totals: Dict[str, int], reason_counts: Counter,
                 f'## Crawl results\n\n'
                 f'Processed: {totals["total"]}; succeeded: {totals["ok"]}; '
                 f'failed: {failed}; skipped: {totals["skipped"]}.\n\n'
+                f'Newly recorded by server: {totals["updated"]} of {reported} reported.\n\n'
                 f'Failure rate (excluding skips): {failure_rate:.1%}.\n\n'
             )
+            if empty_run_message:
+                summary.write(f'{empty_run_message}\n\n')
             for reason, count in reason_counts.most_common(20):
                 summary.write(f'- `{reason}`: {count}\n')
             if site_summaries:
@@ -1434,7 +1427,7 @@ def main() -> None:
                 source_mode=config.source_mode,
             )
             refresh_on_this_page = False
-            tasks = payload.get('tasks', [])
+            tasks = payload['tasks']
 
             if not tasks:
                 if page_index == 0:
@@ -1456,8 +1449,13 @@ def main() -> None:
             if batch_size < config.page_size:
                 break
 
+    empty_run_message = ''
     if not fetched_any_task:
-        return
+        empty_run_message = 'No tasks available for the selected source and tiers.'
+        if config.source_mode == 'catalog':
+            print(f'::warning::{empty_run_message} Check the catalog task source.')
+    elif not totals['total']:
+        empty_run_message = 'Tasks were available, but none matched this shard.'
 
     elapsed = time.time() - start
     info(
@@ -1467,7 +1465,7 @@ def main() -> None:
         f'elapsed={elapsed:.1f}s'
     )
     _log_issue_summary('运行', run_id, 'all', config.source_mode, None, run_reason_counts, run_host_counts)
-    _check_run_health(totals, run_reason_counts, run_site_summaries)
+    _check_run_health(totals, run_reason_counts, run_site_summaries, empty_run_message=empty_run_message)
 
 
 if __name__ == '__main__':

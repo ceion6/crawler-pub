@@ -32,6 +32,24 @@ class TaskClientTests(unittest.TestCase):
             timeout=30,
         )
 
+    def test_pull_task_page_rejects_invalid_response(self):
+        with patch.dict('os.environ', {'MONITOR_API_BASE_URL': 'https://example.test'}), \
+                patch('runner.task_client.signed_post') as post:
+            for payload in ({'status': 'error', 'tasks': []}, {'status': 'ok'},
+                            {'status': 'ok', 'tasks': None}, {'status': 'ok', 'tasks': [{}]}):
+                with self.subTest(payload=payload):
+                    post.return_value.json.return_value = payload
+                    with self.assertRaisesRegex(RuntimeError, '拉取任务响应无效'):
+                        task_client.pull_task_page(tier='low', limit=20)
+
+    def test_pull_task_page_rejects_invalid_json(self):
+        response = Mock()
+        response.json.side_effect = ValueError('invalid JSON')
+        with patch.dict('os.environ', {'MONITOR_API_BASE_URL': 'https://example.test'}), \
+                patch('runner.task_client.signed_post', return_value=response):
+            with self.assertRaisesRegex(RuntimeError, '拉取任务响应无效'):
+                task_client.pull_task_page(tier='low', limit=20)
+
 
 if __name__ == '__main__':
     unittest.main()

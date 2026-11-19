@@ -2,6 +2,7 @@ import hashlib
 import importlib
 import json
 import os
+import re
 import sys
 import tempfile
 import zipfile
@@ -12,6 +13,26 @@ from bs4 import BeautifulSoup
 
 from runner.auth_client import signed_get
 from runner.safe_logger import info, warn
+
+
+_IN_STOCK_MARKERS = re.compile(r'\b(?:in stock|add to cart|add to bag|buy now|auf lager|en stock)\b')
+_OUT_OF_STOCK_MARKERS = re.compile(
+    r'\b(?:out of stock|sold out|(?:not(?: currently| yet)?|no longer) in stock|'
+    r'ausverkauft|nicht auf lager|(?:pas|plus) en stock|épuisé|agotado)\b'
+)
+
+
+def generic_stock_result(text: str) -> Dict:
+    normalized = ' '.join(text.casefold().split())
+    # A negated stock marker must not count as positive evidence too.
+    remaining, out_of_stock = _OUT_OF_STOCK_MARKERS.subn(' ', normalized)
+    in_stock = bool(_IN_STOCK_MARKERS.search(remaining))
+    reason = ''
+    if in_stock and out_of_stock:
+        reason = 'conflicting_stock_evidence'
+    elif not in_stock and not out_of_stock:
+        reason = 'missing_stock_evidence'
+    return {'fetch_ok': not reason, 'in_stock': in_stock and not reason, 'reason': reason}
 
 
 class StrategyRuntime:
@@ -124,16 +145,21 @@ class StrategyRuntime:
                     'price': '',
                     'reason': f'page_complete_error:{type(exc).__name__}',
                 }
-        in_stock = bool(strategy.check_stock(soup, url, text_content))
+        if getattr(strategy, 'site_identifier', None) == 'default':
+            stock_result = generic_stock_result(text_content)
+        else:
+            stock_result = {
+                'fetch_ok': True,
+                'in_stock': bool(strategy.check_stock(soup, url, text_content)),
+                'reason': '',
+            }
         try:
             price = strategy.extract_price(soup, url, normalized_task) or ''
         except TypeError:
             price = strategy.extract_price(soup, url) or ''
         return {
-            'fetch_ok': True,
-            'in_stock': in_stock,
+            **stock_result,
             'price': price,
-            'reason': '',
         }
 
     def _evaluate_selenium(self, strategy, url: str, task: Dict) -> Dict:

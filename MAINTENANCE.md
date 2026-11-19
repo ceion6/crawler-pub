@@ -27,6 +27,10 @@ Review actual `ok`, `failed`, `skipped` and reported results, not just the green
 run icon. The run summary lists failure reasons. A run fails after reporting its
 results if every reported fetch failed, or at least 10 fetches failed and the
 failure rate reached 20%. Explicit skips are excluded from the denominator.
+The summary shows newly recorded server observations separately from fetch
+results. A replay can record zero new observations. Empty task pools and
+shards still get a summary. An empty catalog pool raises a warning. An
+invalid task response or report acknowledgement fails the run.
 
 4N and 70 use their public tobacco collection feeds. All pages are loaded once
 and reused across threads and task pages. Requested variant IDs determine stock
@@ -42,5 +46,9 @@ every affected listing is still reported as a failed fetch, and a new process
 probes again. Product-missing JSON responses do not stop other products.
 404s require checking whether the listing was removed or renamed. Neither
 condition should be converted into a successful stock result.
+
+The generic parser requires explicit, consistent stock markers. Missing or
+conflicting markers produce failed observations and preserve the last
+confirmed inventory.
 
 Local checks: `python -m pytest tests -q` and `git diff --check`.

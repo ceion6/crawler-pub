@@ -2,7 +2,7 @@ name: Hourly Subscription Crawl
 
 on:
   schedule:
-    - cron: '7 * * * *'
+    - cron: '17 * * * *'
   workflow_dispatch:
     inputs:
       tiers:

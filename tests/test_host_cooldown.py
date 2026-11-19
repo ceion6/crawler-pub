@@ -69,7 +69,7 @@ def test_host_summary_keeps_cooldown_failures_visible(tmp_path, monkeypatch):
     assert sites['a.test'] == Counter(total=3, ok=1, failed=2, skipped=0, cooldown=1)
     summary = tmp_path / 'summary.md'
     monkeypatch.setenv('GITHUB_STEP_SUMMARY', str(summary))
-    main._check_run_health({'total': 4, 'reported': 3, 'ok': 1, 'failed': 2, 'skipped': 1},
+    main._check_run_health({'total': 4, 'reported': 3, 'ok': 1, 'failed': 2, 'skipped': 1, 'updated': 3},
                            Counter({'host_cooldown:http_503': 1, 'http_404': 1}), sites)
     assert 'a.test' in summary.read_text()
     assert 'Cooldown' in summary.read_text()

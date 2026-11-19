@@ -64,6 +64,29 @@ class RunnerMainTests(unittest.TestCase):
         self.assertEqual(scraper.get.call_count, 2)
         sleep_mock.assert_called()
 
+    def test_generic_stock_requires_unambiguous_inventory_evidence(self):
+        task = {'url': 'https://example.test/products/sample'}
+        cases = (
+            ('In stock', True, True, ''),
+            ('Sold out', True, False, ''),
+            ('Not currently in stock', True, False, ''),
+            ('Page temporarily unavailable', False, False, 'missing_stock_evidence'),
+            ('Shipping available in your region', False, False, 'missing_stock_evidence'),
+            ('Sold out <button>Add to cart</button>', False, False, 'conflicting_stock_evidence'),
+        )
+        for text, fetch_ok, in_stock, reason in cases:
+            with self.subTest(text=text):
+                response = FakeResponse(200, f'<html><body>{text} $12.50</body></html>')
+                with patch('runner.main._build_http_client'), \
+                        patch('runner.main._request_once', return_value=response), \
+                        patch.object(main.STRATEGY_RUNTIME, 'evaluate', return_value={}):
+                    result = main.crawl_one(task)
+
+                self.assertEqual(result['fetch_ok'], fetch_ok)
+                self.assertEqual(result['in_stock'], in_stock)
+                self.assertEqual(result['reason'], reason)
+                self.assertEqual(result['price'], '$12.50')
+
     def test_crawl_one_keeps_failure_shape_after_retry_exhausted(self):
         task = {'url': 'https://example.test/products/sample'}
         policy = main.HostPolicy(max_parallel=1, min_interval_seconds=0.0, max_attempts=3, backoff_base_seconds=0.1, backoff_cap_seconds=0.2)
